@@ -276,9 +276,14 @@ class ParallelMoveResolver {
     } else {
       DCHECK(source.IsConstant());
       DCHECK(IsConstantNode(node->opcode()));
+#ifdef V8_COMPRESS_POINTERS
+      if constexpr (DecompressIfNeeded) {
+        if (needs_decompression == kNeedsDecompression) {
+          node->SetTaggedResultNeedsDecompress();
+        }
+      }
+#endif
       materializing_register_moves_[target_reg.code()] = node;
-      // No need to update `targets.needs_decompression`, materialization is
-      // always decompressed.
       return;
     }
 
@@ -321,9 +326,14 @@ class ParallelMoveResolver {
     } else {
       DCHECK(source.IsConstant());
       DCHECK(IsConstantNode(node->opcode()));
+#ifdef V8_COMPRESS_POINTERS
+      if constexpr (DecompressIfNeeded) {
+        if (needs_decompression == kNeedsDecompression) {
+          node->SetTaggedResultNeedsDecompress();
+        }
+      }
+#endif
       materializing_stack_slot_moves_.emplace_back(target_slot, node);
-      // No need to update `targets.needs_decompression`, materialization is
-      // always decompressed.
       return;
     }
 
@@ -1420,18 +1430,10 @@ class MaglevFrameTranslationBuilder {
         JSTrampolineDescriptor::GetRegisterParameterCount();
 
     if (frame.is_javascript()) {
-      if (frame.is_with_catch()) {
-        translation_array_builder_
-            ->BeginJavaScriptBuiltinContinuationWithCatchFrame(
-                bailout_id, literal_id,
-                frame.parameters().length() + kFixedJSFrameRegisterParameters);
-      } else {
-        translation_array_builder_->BeginJavaScriptBuiltinContinuationFrame(
-            bailout_id, literal_id,
-            frame.parameters().length() + kFixedJSFrameRegisterParameters);
-      }
+      translation_array_builder_->BeginJavaScriptBuiltinContinuationFrame(
+          bailout_id, literal_id,
+          frame.parameters().length() + kFixedJSFrameRegisterParameters);
     } else {
-      DCHECK(!frame.is_with_catch());
       translation_array_builder_->BeginBuiltinContinuationFrame(
           bailout_id, literal_id, frame.parameters().length());
     }
@@ -1562,7 +1564,7 @@ class MaglevFrameTranslationBuilder {
     return kNotDuplicated;
   }
 
-  void BuildNestedValue(const ValueNode* value,
+  void BuildNestedValue(const VirtualObject* object, const ValueNode* value,
                         const InputLocation*& input_location,
                         const VirtualObjectList& virtual_objects) {
     const Opcode opcode = value->opcode();
@@ -1571,16 +1573,22 @@ class MaglevFrameTranslationBuilder {
     DCHECK_NE(opcode, Opcode::kIdentity);
     if (IsConstantNode(opcode)) {
       if (opcode == Opcode::kFloat64Constant) {
-        Float64 value_as_float = value->Cast<Float64Constant>()->value();
-        if (value_as_float.is_hole_nan()) {
-          translation_array_builder_->StoreLiteral(
-              GetDeoptLiteral(ReadOnlyRoots{local_isolate_}.the_hole_value()));
-          return;
-        }
+        DCHECK(object->has_static_map());
+        if (object->map()->IsFixedDoubleArrayMap()) {
+          Float64 value_as_float = value->Cast<Float64Constant>()->value();
+          if (value_as_float.is_hole_nan()) {
+            translation_array_builder_->StoreLiteral(GetDeoptLiteral(
+                ReadOnlyRoots{local_isolate_}.the_hole_value()));
+            return;
+          }
 #ifdef V8_ENABLE_UNDEFINED_DOUBLE
-        // TODO(nicohartmann): Handle is_undefined_nan here.
-        DCHECK(!value_as_float.is_undefined_nan());
+          if (value_as_float.is_undefined_nan()) {
+            translation_array_builder_->StoreLiteral(GetDeoptLiteral(
+                ReadOnlyRoots{local_isolate_}.undefined_value()));
+            return;
+          }
 #endif  //  V8_ENABLE_UNDEFINED_DOUBLE
+        }
       }
       translation_array_builder_->StoreLiteral(
           GetDeoptLiteral(*value->Reify(local_isolate_)));
@@ -1646,7 +1654,7 @@ class MaglevFrameTranslationBuilder {
       translation_array_builder_->BeginCapturedObject(fields);
     }
     auto callback = [&](ValueNode* node, const vobj::Field& desc) -> bool {
-      BuildNestedValue(node, input_location, virtual_objects);
+      BuildNestedValue(object, node, input_location, virtual_objects);
       return true;
     };
     object->ForEachSlot(callback,
@@ -1884,6 +1892,7 @@ bool MaglevCodeGenerator::EmitCode() {
   EmitDeferredCode();
   if (!EmitDeopts()) return false;
   EmitExceptionHandlerTrampolines();
+  EmitRetainedObjects();
   __ FinishCode();
 
   code_gen_succeeded_ = true;
@@ -2031,6 +2040,21 @@ void MaglevCodeGenerator::EmitExceptionHandlerTrampolines() {
 #ifdef DEBUG
   masm()->set_allow_allocate(false);
 #endif
+}
+
+void MaglevCodeGenerator::EmitRetainedObjects() {
+  if (code_gen_state_.retained_objects().empty()) return;
+
+  // This code is never executed; it's just for inserting weak embedded objects
+  // into the code.
+  __ RecordComment("-- Retained objects");
+  __ Trap();
+
+  MaglevAssembler::TemporaryRegisterScope temps(masm());
+  Register scratch = temps.AcquireScratch();
+  for (Handle<HeapObject> heap_object : code_gen_state_.retained_objects()) {
+    __ Move(scratch, heap_object);
+  }
 }
 
 void MaglevCodeGenerator::EmitMetadata() {

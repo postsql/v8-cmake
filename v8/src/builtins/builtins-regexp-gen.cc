@@ -190,6 +190,10 @@ void RegExpBuiltinsAssembler::TryRegExpSplitCacheLookup(
 
   TNode<FixedArray> cache =
       CAST(CodeAssembler::LoadRoot(RootIndex::kRegExpSplitCache));
+  // The cache is allocated on the first Enter; until then there is nothing to
+  // probe.
+  GotoIf(TaggedEqual(cache, EmptyFixedArrayConstant()), &miss);
+
   TNode<Object> key_pattern =
       LoadObjectField(data, offsetof(RegExpData, wrapper_));
 
@@ -263,10 +267,10 @@ void RegExpBuiltinsAssembler::ReplayLastMatchInfo(
   match_info =
       PrepareMatchInfo(context, match_info, SmiTag(register_count), subject);
 
-  // Both sides hold the capture offsets as Smis, so no write barrier is needed.
-  CopyRange(match_info, RegExpMatchInfo::OffsetOfElementAt(0), last_match_cache,
-            FixedArray::OffsetOfElementAt(0), register_count,
-            UNSAFE_SKIP_WRITE_BARRIER);
+  // Both sides hold the capture offsets as Smis.
+  CopyRange<Smi>(match_info, RegExpMatchInfo::OffsetOfElementAt(0),
+                 last_match_cache, FixedArray::OffsetOfElementAt(0),
+                 register_count);
   Goto(&done);
 
   BIND(&done);
@@ -288,10 +292,9 @@ TNode<FixedArray> RegExpBuiltinsAssembler::SnapshotLastMatchInfo(
 
   TNode<FixedArray> snapshot =
       CAST(AllocateFixedArray(PACKED_ELEMENTS, register_count));
-  // Both sides hold the capture offsets as Smis, so no write barrier is needed.
-  CopyRange(snapshot, FixedArray::OffsetOfElementAt(0), match_info,
-            RegExpMatchInfo::OffsetOfElementAt(0), register_count,
-            UNSAFE_SKIP_WRITE_BARRIER);
+  // Both sides hold the capture offsets as Smis.
+  CopyRange<Smi>(snapshot, FixedArray::OffsetOfElementAt(0), match_info,
+                 RegExpMatchInfo::OffsetOfElementAt(0), register_count);
   var_result = snapshot;
   Goto(&done);
 
@@ -1780,7 +1783,7 @@ TNode<Number> RegExpBuiltinsAssembler::AdvanceStringIndex(
     // Must be in Smi range on the fast path. We control the value of {index}
     // on all call-sites and can never exceed the length of the string.
     static_assert(String::kMaxLength + 2 < Smi::kMaxValue);
-    // TODO(532595489): Hard CHECK for now as a quick fix.
+    // CSA_CHECK kept as defense-in-depth against unexpected fast-path overflow.
     CSA_CHECK(this, TaggedIsPositiveSmi(index_plus_one));
   }
 

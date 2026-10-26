@@ -75,6 +75,12 @@ V8_EXPORT_PRIVATE inline bool UseApxCmovcc() { return false; }
 V8_EXPORT_PRIVATE inline bool UseApxCcmp() { return false; }
 #endif
 
+#ifdef V8_ENABLE_AVX10_1
+V8_EXPORT_PRIVATE bool UseAvx10_1();
+#else
+V8_EXPORT_PRIVATE inline bool UseAvx10_1() { return false; }
+#endif
+
 enum Condition : int {
   overflow = 0,
   no_overflow = 1,
@@ -349,7 +355,6 @@ class V8_EXPORT_PRIVATE Operand {
     return label_;
   }
 
-#ifdef V8_ENABLE_AVX10_1
   // Rewrite this memory operand's displacement into the EVEX compressed
   // displacement form (disp8*N) when possible. {*this} should carry a raw
   // (unscaled) displacement.
@@ -436,7 +441,6 @@ class V8_EXPORT_PRIVATE Operand {
     new_operand.memory_.buf[new_operand.memory_.len - 1] = cdisp8;
     return new_operand;
   }
-#endif  // V8_ENABLE_AVX10_1
 
   // Checks whether either base or index register is the given register.
   // Does not check the "reg" part of the Operand.
@@ -1550,7 +1554,6 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   void vinstr(uint8_t op, Reg1 dst, Reg2 src1, Op src2, SIMDPrefix pp,
               LeadingOpcode m, VexW w, CpuFeature feature = AVX2);
 
-#ifdef V8_ENABLE_AVX10_1
   void vinstr_evex(uint8_t op, XMMRegister dst, XMMRegister src1,
                    XMMRegister src2, SIMDPrefix pp, LeadingOpcode m, VexW w,
                    OpMask mask = k0, MaskingType z = kMerging,
@@ -1567,7 +1570,6 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
                    SIMDPrefix pp, LeadingOpcode m, VexW w, TupleType tuple_type,
                    OpMask mask = k0, MaskingType z = kMerging,
                    CpuFeature feature = AVX10_1);
-#endif  // V8_ENABLE_AVX10_1
 
   // Compressed-displacement (disp8*N) scale factor N in bytes, per Intel SDM
   // Vol.2 §2.6.5, Tables 2-34..2-36. {vlen} is the vector length in bytes
@@ -2649,7 +2651,6 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   }
 
   // AVX10.1 instructions
-#ifdef V8_ENABLE_AVX10_1
   void vpmullq(XMMRegister dst, XMMRegister src1, XMMRegister src2) {
     vinstr_evex(0x40, dst, src1, src2, k66, k0F38, kW1);
   }
@@ -2708,7 +2709,48 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   void vpopcntb(XMMRegister dst, Operand src) {
     vinstr_evex(0x54, dst, xmm0, src, k66, k0F38, kW0, kFull);
   }
-#endif  // V8_ENABLE_AVX10_1
+
+  // vpternlogd/q — bitwise ternary logic.
+  void vpternlogd(XMMRegister dst, XMMRegister src1, XMMRegister src2,
+                  uint8_t imm8, OpMask mask = k0, MaskingType z = kMerging) {
+    vinstr_evex(0x25, dst, src1, src2, k66, k0F3A, kW0, mask, z);
+    emit(imm8);
+  }
+  void vpternlogd(XMMRegister dst, XMMRegister src1, Operand src2, uint8_t imm8,
+                  OpMask mask = k0, MaskingType z = kMerging) {
+    vinstr_evex(0x25, dst, src1, src2, k66, k0F3A, kW0, kFull, mask, z);
+    emit(imm8);
+  }
+  void vpternlogd(YMMRegister dst, YMMRegister src1, YMMRegister src2,
+                  uint8_t imm8, OpMask mask = k0, MaskingType z = kMerging) {
+    vinstr_evex(0x25, dst, src1, src2, k66, k0F3A, kW0, mask, z);
+    emit(imm8);
+  }
+  void vpternlogd(YMMRegister dst, YMMRegister src1, Operand src2, uint8_t imm8,
+                  OpMask mask = k0, MaskingType z = kMerging) {
+    vinstr_evex(0x25, dst, src1, src2, k66, k0F3A, kW0, kFull, mask, z);
+    emit(imm8);
+  }
+  void vpternlogq(XMMRegister dst, XMMRegister src1, XMMRegister src2,
+                  uint8_t imm8, OpMask mask = k0, MaskingType z = kMerging) {
+    vinstr_evex(0x25, dst, src1, src2, k66, k0F3A, kW1, mask, z);
+    emit(imm8);
+  }
+  void vpternlogq(XMMRegister dst, XMMRegister src1, Operand src2, uint8_t imm8,
+                  OpMask mask = k0, MaskingType z = kMerging) {
+    vinstr_evex(0x25, dst, src1, src2, k66, k0F3A, kW1, kFull, mask, z);
+    emit(imm8);
+  }
+  void vpternlogq(YMMRegister dst, YMMRegister src1, YMMRegister src2,
+                  uint8_t imm8, OpMask mask = k0, MaskingType z = kMerging) {
+    vinstr_evex(0x25, dst, src1, src2, k66, k0F3A, kW1, mask, z);
+    emit(imm8);
+  }
+  void vpternlogq(YMMRegister dst, YMMRegister src1, Operand src2, uint8_t imm8,
+                  OpMask mask = k0, MaskingType z = kMerging) {
+    vinstr_evex(0x25, dst, src1, src2, k66, k0F3A, kW1, kFull, mask, z);
+    emit(imm8);
+  }
 
   // BMI instruction
   void andnq(Register dst, Register src1, Register src2) {
@@ -3171,6 +3213,164 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
     }
   }
 
+#ifdef V8_ENABLE_APX_F
+  // True if the operand can only be encoded with a REX2 prefix, i.e. if it
+  // references one of the extended GPRs r16-r31 -- directly, or as the base or
+  // index register of a memory operand.
+  inline bool needs_rex2_prefix(Register reg) { return reg.bit4(); }
+  inline bool needs_rex2_prefix(Operand op) { return op.rex2(); }
+
+  template <class P1, class P2>
+  bool needs_rex2_prefix(P1 p1, P2 p2) {
+    return needs_rex2_prefix(p1) || needs_rex2_prefix(p2);
+  }
+#endif  // V8_ENABLE_APX_F
+
+  // Emits the 0x0F escape byte if the opcode lives in legacy map 1. Only a
+  // legacy REX prefix needs this: a REX2 prefix carries the map in its M0 bit
+  // and must be the last byte before the opcode.
+  inline void emit_legacy_map_escape(Rex2MapID m) {
+    if (m == kRex2Map1) emit(0x0F);
+  }
+
+  // emit_rex2_or_rex[_64|_32](operands..., m) emits everything between the
+  // legacy prefixes and the opcode of an instruction whose opcode lives in
+  // legacy map {m} -- kRex2Map0 for a one-byte opcode, kRex2Map1 for a
+  // 0x0F-escaped one:
+  //   - a single REX2 prefix, if any operand references r16-r31. REX2 encodes
+  //     the map itself, so it replaces the 0x0F escape byte.
+  //   - otherwise the legacy REX prefix, followed by the 0x0F escape byte if
+  //     {m} is kRex2Map1.
+  // The caller emits only the opcode, so the prefix and the escape byte cannot
+  // get out of sync. Any legacy prefix (0x66/0xF2/0xF3/segment override) must
+  // already have been emitted; REX and REX2 both come last.
+  //
+  // REX2 has a single map bit, so instructions in the 0x0F38 and 0x0F3A maps
+  // cannot use these helpers at all -- they need a VEX or EVEX encoding to
+  // reach the extended GPRs.
+  //
+  // Unlike the emit_rex_* helpers these do not accept an XMMRegister yet: the
+  // underlying emit_rex2_* emitters only take a GPR in the reg field.
+  void emit_rex2_or_rex(int size, Rex2MapID m) {
+    // Without operands there is no EGPR to encode, so REX2 is never needed.
+    emit_rex(size);
+    emit_legacy_map_escape(m);
+  }
+
+  template <class P1>
+  void emit_rex2_or_rex(P1 p1, int size, Rex2MapID m) {
+#ifdef V8_ENABLE_APX_F
+    if (needs_rex2_prefix(p1)) {
+      if (size == kInt64Size) {
+        emit_rex2_64(p1, m);
+      } else {
+        DCHECK_EQ(size, kInt32Size);
+        emit_rex2_32(p1, m);
+      }
+      return;
+    }
+#endif  // V8_ENABLE_APX_F
+    emit_rex(p1, size);
+    emit_legacy_map_escape(m);
+  }
+
+  template <class P1, class P2>
+  void emit_rex2_or_rex(P1 p1, P2 p2, int size, Rex2MapID m) {
+#ifdef V8_ENABLE_APX_F
+    if (needs_rex2_prefix(p1, p2)) {
+      if (size == kInt64Size) {
+        emit_rex2_64(p1, p2, m);
+      } else {
+        DCHECK_EQ(size, kInt32Size);
+        emit_rex2_32(p1, p2, m);
+      }
+      return;
+    }
+#endif  // V8_ENABLE_APX_F
+    emit_rex(p1, p2, size);
+    emit_legacy_map_escape(m);
+  }
+
+  void emit_rex2_or_rex_64(Rex2MapID m) {
+    emit_rex_64();
+    emit_legacy_map_escape(m);
+  }
+
+  template <class P1>
+  void emit_rex2_or_rex_64(P1 p1, Rex2MapID m) {
+#ifdef V8_ENABLE_APX_F
+    if (needs_rex2_prefix(p1)) {
+      emit_rex2_64(p1, m);
+      return;
+    }
+#endif  // V8_ENABLE_APX_F
+    emit_rex_64(p1);
+    emit_legacy_map_escape(m);
+  }
+
+  template <class P1, class P2>
+  void emit_rex2_or_rex_64(P1 p1, P2 p2, Rex2MapID m) {
+#ifdef V8_ENABLE_APX_F
+    if (needs_rex2_prefix(p1, p2)) {
+      emit_rex2_64(p1, p2, m);
+      return;
+    }
+#endif  // V8_ENABLE_APX_F
+    emit_rex_64(p1, p2);
+    emit_legacy_map_escape(m);
+  }
+
+  template <class P1>
+  void emit_rex2_or_rex_32(P1 p1, Rex2MapID m) {
+#ifdef V8_ENABLE_APX_F
+    if (needs_rex2_prefix(p1)) {
+      emit_rex2_32(p1, m);
+      return;
+    }
+#endif  // V8_ENABLE_APX_F
+    emit_rex_32(p1);
+    emit_legacy_map_escape(m);
+  }
+
+  template <class P1, class P2>
+  void emit_rex2_or_rex_32(P1 p1, P2 p2, Rex2MapID m) {
+#ifdef V8_ENABLE_APX_F
+    if (needs_rex2_prefix(p1, p2)) {
+      emit_rex2_32(p1, p2, m);
+      return;
+    }
+#endif  // V8_ENABLE_APX_F
+    emit_rex_32(p1, p2);
+    emit_legacy_map_escape(m);
+  }
+
+  // As emit_rex2_or_rex_32, but the REX prefix is omitted entirely when it
+  // would be all-zero. Only the REX fallback is optional: a REX2 prefix is
+  // always emitted when an operand needs one.
+  template <class P1>
+  void emit_optional_rex2_or_rex_32(P1 p1, Rex2MapID m) {
+#ifdef V8_ENABLE_APX_F
+    if (needs_rex2_prefix(p1)) {
+      emit_rex2_32(p1, m);
+      return;
+    }
+#endif  // V8_ENABLE_APX_F
+    emit_optional_rex_32(p1);
+    emit_legacy_map_escape(m);
+  }
+
+  template <class P1, class P2>
+  void emit_optional_rex2_or_rex_32(P1 p1, P2 p2, Rex2MapID m) {
+#ifdef V8_ENABLE_APX_F
+    if (needs_rex2_prefix(p1, p2)) {
+      emit_rex2_32(p1, p2, m);
+      return;
+    }
+#endif  // V8_ENABLE_APX_F
+    emit_optional_rex_32(p1, p2);
+    emit_legacy_map_escape(m);
+  }
+
   // Emit vex prefix
   void emit_vex2_byte0() { emit(0xc5); }
   inline void emit_vex2_byte1(XMMRegister reg, XMMRegister v, VectorLength l,
@@ -3194,9 +3394,7 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
                               VexW w);
 
   // Emit the vector-form EVEX prefix (reuses emit_evex_byte0() above). Shared
-  // by any EVEX-encoded feature, so it is available whenever AVX10.1 or APX is
-  // enabled.
-#if defined(V8_ENABLE_AVX10_1) || defined(V8_ENABLE_APX_F)
+  // by any EVEX-encoded feature (AVX10, APX).
   inline void emit_evex_byte1(XMMRegister reg, XMMRegister rm, LeadingOpcode m);
   inline void emit_evex_byte1(XMMRegister reg, Operand rm, LeadingOpcode m);
   inline void emit_evex_byte2(VexW w, XMMRegister v, SIMDPrefix pp);
@@ -3211,7 +3409,6 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
                                VectorLength l, SIMDPrefix pp, LeadingOpcode mm,
                                VexW w, OpMask aaa = k0,
                                MaskingType z = kMerging);
-#endif  // V8_ENABLE_AVX10_1 || V8_ENABLE_APX_F
 
   // Emit the ModR/M byte, and optionally the SIB byte and
   // 1- or 4-byte offset for a memory operand.  Also encodes
@@ -3252,9 +3449,7 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   void emit_sse_operand(XMMRegister dst, Register src);
   void emit_sse_operand(Register dst, XMMRegister src);
   void emit_sse_operand(XMMRegister dst);
-#ifdef V8_ENABLE_AVX10_1
   void emit_sse_operand(XMMRegister reg, Operand adr, uint8_t cd8_scale);
-#endif
 
   // Emit machine code for one of the operations ADD, ADC, SUB, SBC,
   // AND, OR, XOR, or CMP.  The encodings of these operations are all

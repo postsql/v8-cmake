@@ -212,6 +212,14 @@ void AccessorAssembler::TryHomomorphicCase(TNode<Object> lookup_start_object,
     CSA_DCHECK(this,
                Word32BitwiseNot(IsDictionaryMap(lookup_start_object_map)));
 
+    // Reject special receivers. Access checks and named interceptors imply
+    // special receiver.
+    GotoIf(IsSpecialReceiverMap(lookup_start_object_map), miss);
+    CSA_DCHECK(this, Word32BinaryNot(IsSetWord32(
+                         LoadMapBitField(lookup_start_object_map),
+                         Map::Bits1::HasNamedInterceptorBit::kMask |
+                             Map::Bits1::IsAccessCheckNeededBit::kMask)));
+
     // Load the descriptor at the index and verify that the key matches the
     // loaded name.
     TNode<DescriptorArray> descriptors =
@@ -1145,7 +1153,7 @@ void AccessorAssembler::HandleLoadICSmiHandlerLoadNamedCase(
     // The handler is only installed for exports that exist.
     TNode<Object> value = LoadCellValue(cell);
     Label is_the_hole(this, Label::kDeferred);
-    GotoIf(IsTheHole(value), &is_the_hole);
+    GotoIf(IsTdzHole(value), &is_the_hole);
     exit_point->Return(value);
 
     BIND(&is_the_hole);
@@ -3929,7 +3937,7 @@ void AccessorAssembler::ScriptContextTableLookup(
     TNode<IntPtrT> var_index = IntPtrAdd(
         IntPtrConstant(Context::MIN_CONTEXT_SLOTS), context_local_index);
     TNode<Object> result = LoadContextElement(script_context, var_index);
-    GotoIf(IsTheHole(result), found_hole);
+    GotoIf(IsTdzHole(result), found_hole);
     Return(result);
   }
 }
@@ -5086,86 +5094,6 @@ void AccessorAssembler::GenerateLoadICStringLengthBaseline() {
   BIND(&update_feedback);
   TailCallRuntime(Runtime::kGetStringLengthAndUpdateFeedback, context, receiver,
                   slot, vector);
-
-  BIND(&miss);
-  direct_exit.ReturnCallRuntime(Runtime::kLoadIC_Miss_FromBaseline, context,
-                                receiver, name, slot, vector);
-}
-
-void AccessorAssembler::GenerateLoadICConstantFromStringPrototypeBaseline() {
-  using Descriptor = LoadBaselineDescriptor;
-
-  auto receiver = Parameter<JSAny>(Descriptor::kReceiver);
-  auto name = Parameter<Object>(Descriptor::kName);
-  auto slot = Parameter<TaggedIndex>(Descriptor::kSlot);
-  TNode<FeedbackVector> vector = LoadFeedbackVectorFromBaseline();
-  TNode<Context> context = LoadContextFromBaseline();
-
-  ExitPoint direct_exit(this);
-  TVARIABLE(MaybeObject, var_handler);
-  Label if_handler(this), miss(this, Label::kDeferred);
-
-  GotoIf(TaggedIsSmi(receiver), &miss);
-  GotoIfNot(IsString(UncheckedCast<HeapObject>(receiver)), &miss);
-
-  int32_t header_size =
-      FeedbackVector::kRawFeedbackSlotsOffset - kHeapObjectTag;
-  // Adding |header_size| with a separate IntPtrAdd rather than passing it
-  // into ElementOffsetFromIndex() allows it to be folded into a single
-  // [base, index, offset] indirect memory access on x64.
-  TNode<IntPtrT> offset = ElementOffsetFromIndex(slot, HOLEY_ELEMENTS);
-  TNode<MaybeObject> raw_handler = UncheckedCast<MaybeObject>(
-      Load(MachineType::AnyTagged(), vector,
-           IntPtrAdd(offset, IntPtrConstant(header_size + kTaggedSize))));
-
-  GotoIfNot(IsStrong(raw_handler), &miss);
-  GotoIfNot(IsLoadHandler(CAST(raw_handler)), &miss);
-  TNode<DataHandler> handler = CAST(raw_handler);
-
-  // Check prototype validity cell.
-  TNode<MaybeObject> validity_cell_value;
-  {
-    TNode<Object> maybe_validity_cell =
-        LoadObjectField(handler, offsetof(LoadHandler, validity_cell_));
-    validity_cell_value =
-        CheckPrototypeValidityCell(maybe_validity_cell, &miss);
-    // CheckPrototypeValidityCell guarantees that the returned value is not
-    // a cleared weak reference value.
-    CSA_DCHECK(this, IsNotCleared(validity_cell_value));
-  }
-
-  // Check handler's kind.
-  TNode<Smi> smi_handler =
-      CAST(LoadObjectField(handler, offsetof(LoadHandler, smi_handler_)));
-  GotoIfNot(
-      SmiEqual(
-          smi_handler,
-          SmiConstant(
-              LoadHandler::KindBits::encode(
-                  LoadHandler::Kind::kConstantFromPrototype) |
-              LoadHandler::DoAccessCheckOnLookupStartObjectBits::encode(true))),
-      &miss);
-
-  // Check native context.
-  TNode<NativeContext> expected_native_context =
-      CAST(GetHeapObjectAssumeWeak(validity_cell_value));
-  TNode<NativeContext> native_context = LoadNativeContext(context);
-  GotoIfNot(TaggedEqual(expected_native_context, native_context), &miss);
-
-  // Load constant from the handler.
-  Label is_smi(this), is_not_smi(this);
-  TNode<MaybeObject> constant = LoadHandlerDataField(handler, 1);
-  Branch(TaggedIsSmi(constant), &is_smi, &is_not_smi);
-  BIND(&is_smi);
-  {
-    TNode<Object> result = CAST(constant);
-    direct_exit.Return(result);
-  }
-  BIND(&is_not_smi);
-  {
-    TNode<Object> result = GetHeapObjectAssumeWeak(constant, &miss);
-    direct_exit.Return(result);
-  }
 
   BIND(&miss);
   direct_exit.ReturnCallRuntime(Runtime::kLoadIC_Miss_FromBaseline, context,

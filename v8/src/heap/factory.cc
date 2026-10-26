@@ -371,6 +371,7 @@ DirectHandle<HeapObject> Factory::NewFillerObject(int size,
           size, allocation, origin, alignment);
   heap->CreateFillerObjectAt(result.address(), size,
                              ClearFreedMemoryMode{false}, allocation);
+  SharedObjectConditionalSafePublishGuard publish_guard(result, allocation);
   return DirectHandle<HeapObject>(result, isolate());
 }
 
@@ -897,7 +898,6 @@ MaybeHandle<String> NewStringFromBytes(Isolate* isolate, PeekBytes peek_bytes,
       return isolate->factory()->LookupSingleCharacterStringFromCode(codepoint);
     }
     // Allocate string.
-    SharedObjectConditionalSafePublishGuard publish_guard(allocation);
     Handle<SeqOneByteString> result;
     ASSIGN_RETURN_ON_EXCEPTION(
         isolate, result,
@@ -905,18 +905,19 @@ MaybeHandle<String> NewStringFromBytes(Isolate* isolate, PeekBytes peek_bytes,
                                             allocation));
 
     DisallowGarbageCollection no_gc;
+    SharedObjectConditionalSafePublishGuard publish_guard(*result, allocation);
     decoder.Decode(result->GetChars(no_gc), peek_bytes());
     return result;
   }
 
   // Allocate string.
-  SharedObjectConditionalSafePublishGuard publish_guard(allocation);
   Handle<SeqTwoByteString> result;
   ASSIGN_RETURN_ON_EXCEPTION(isolate, result,
                              StringPolicy::AllocateTwoByteString(
                                  isolate, decoder.utf16_length(), allocation));
 
   DisallowGarbageCollection no_gc;
+  SharedObjectConditionalSafePublishGuard publish_guard(*result, allocation);
   decoder.Decode(result->GetChars(no_gc), peek_bytes());
   return result;
 }
@@ -968,91 +969,92 @@ MaybeHandle<String> NewStringFromUtf8Variant(Isolate* isolate,
   UNREACHABLE();
 }
 
+inline base::OwnedVector<uint8_t> CopyBytes(const base::Atomic8* src,
+                                            size_t length) {
+  auto copy = base::OwnedVector<uint8_t>::NewForOverwrite(length);
+  base::Relaxed_Memcpy(reinterpret_cast<base::Atomic8*>(copy.data()), src,
+                       length);
+  return copy;
+}
+
+#if V8_ENABLE_WEBASSEMBLY
+inline base::OwnedVector<uint16_t> CopyCodeUnits(const base::Atomic16* src,
+                                                 size_t length) {
+  auto copy = base::OwnedVector<uint16_t>::NewForOverwrite(length);
+  for (size_t i = 0; i < length; i++) {
+    auto dest = reinterpret_cast<base::Atomic16*>(copy.data() + i);
+    base::Relaxed_Store(dest, base::Relaxed_Load(src + i));
+  }
+  return copy;
+}
+#endif  // V8_ENABLE_WEBASSEMBLY
+
 }  // namespace
 
 MaybeHandle<String> Factory::NewStringFromUtf8(
-    base::Vector<const uint8_t> string, unibrow::Utf8Variant utf8_variant,
+    base::Vector<const uint8_t> string, UnicodeConfig config,
     AllocationType allocation) {
   if (string.size() > kMaxInt) {
     // The Utf8Decode can't handle longer inputs, and we couldn't create
     // strings from them anyway.
     THROW_NEW_ERROR(isolate(), NewInvalidStringLengthError());
   }
-  auto peek_bytes = [&]() -> base::Vector<const uint8_t> { return string; };
-  return NewStringFromUtf8Variant(isolate(), peek_bytes, utf8_variant,
+  base::OwnedVector<uint8_t> private_copy;
+  if (config.source_shared()) {
+    private_copy = CopyBytes(
+        reinterpret_cast<const base::Atomic8*>(string.data()), string.size());
+  }
+  auto peek_bytes = [&]() -> base::Vector<const uint8_t> {
+    return config.source_shared() ? private_copy.as_vector() : string;
+  };
+  if (config.dest_shared()) {
+    return NewStringFromUtf8Variant(isolate(), peek_bytes, config.variant(),
+                                    SharedStringBuilder{},
+                                    AllocationType::kSharedOld);
+  }
+  return NewStringFromUtf8Variant(isolate(), peek_bytes, config.variant(),
                                   StringBuilder{}, allocation);
 }
 
 MaybeHandle<String> Factory::NewStringFromUtf8(base::Vector<const char> string,
                                                AllocationType allocation) {
   return NewStringFromUtf8(base::Vector<const uint8_t>::cast(string),
-                           unibrow::Utf8Variant::kLossyUtf8, allocation);
-}
-
-MaybeHandle<String> Factory::NewSharedStringFromUtf8(
-    base::Vector<const uint8_t> string, unibrow::Utf8Variant utf8_variant) {
-  if (string.size() > kMaxInt) {
-    // The Utf8Decode can't handle longer inputs, and we couldn't create
-    // strings from them anyway.
-    THROW_NEW_ERROR(isolate(), NewInvalidStringLengthError());
-  }
-  auto peek_bytes = [&]() -> base::Vector<const uint8_t> { return string; };
-  return NewStringFromUtf8Variant(isolate(), peek_bytes, utf8_variant,
-                                  SharedStringBuilder{},
-                                  AllocationType::kSharedOld);
-}
-
-MaybeHandle<String> Factory::NewSharedStringFromUtf8(
-    base::Vector<const char> string) {
-  return NewSharedStringFromUtf8(base::Vector<const uint8_t>::cast(string),
-                                 unibrow::Utf8Variant::kLossyUtf8);
+                           UnicodeConfig(unibrow::Utf8Variant::kLossyUtf8),
+                           allocation);
 }
 
 #if V8_ENABLE_WEBASSEMBLY
 MaybeDirectHandle<String> Factory::NewStringFromUtf8(
     DirectHandle<WasmArray> array, uint32_t start, uint32_t end,
-    unibrow::Utf8Variant utf8_variant, AllocationType allocation) {
+    UnicodeConfig config) {
   DCHECK_EQ(sizeof(uint8_t), WasmArray::DecodeElementSizeFromMap(array->map()));
   DCHECK_LE(start, end);
   DCHECK_LE(end, array->length());
   // {end - start} can never be more than what the Utf8Decoder can handle.
   static_assert(WasmArray::MaxLength(sizeof(uint8_t)) <= kMaxInt);
-  auto peek_bytes = [&]() -> base::Vector<const uint8_t> {
-    const uint8_t* contents =
-        reinterpret_cast<const uint8_t*>(array->ElementAddress(0));
-    return {contents + start, end - start};
-  };
-  return NewStringFromUtf8Variant(isolate(), peek_bytes, utf8_variant,
-                                  StringBuilder{}, allocation);
-}
-
-MaybeDirectHandle<String> Factory::NewSharedStringFromUtf8(
-    DirectHandle<WasmArray> array, uint32_t start, uint32_t end,
-    unibrow::Utf8Variant utf8_variant) {
-  DCHECK_EQ(sizeof(uint8_t), WasmArray::DecodeElementSizeFromMap(array->map()));
-  DCHECK_LE(start, end);
-  DCHECK_LE(end, array->length());
-  // {end - start} can never be more than what the Utf8Decoder can handle.
-  static_assert(WasmArray::MaxLength(sizeof(uint8_t)) <= kMaxInt);
-
-  // We need a private copy of the array's contents. We have a pass that
-  // validates utf8/computes the string's length and one that copies the bytes,
-  // and we cannot afford to have concurrent modifications to the array between
-  // those.
 
   uint32_t length = end - start;
-  const base::Atomic8* contents =
-      reinterpret_cast<base::Atomic8*>(array->ElementAddress(start));
-  auto private_copy = base::OwnedVector<uint8_t>::NewForOverwrite(length);
-  base::Relaxed_Memcpy(reinterpret_cast<base::Atomic8*>(private_copy.data()),
-                       contents, length);
-
+  base::OwnedVector<uint8_t> private_copy;
+  if (config.source_shared()) {
+    private_copy = CopyBytes(
+        reinterpret_cast<const base::Atomic8*>(array->ElementAddress(start)),
+        length);
+  }
   auto peek_bytes = [&]() -> base::Vector<const uint8_t> {
-    return private_copy.as_vector();
+    if (config.source_shared()) {
+      return private_copy.as_vector();
+    }
+    const uint8_t* contents =
+        reinterpret_cast<const uint8_t*>(array->ElementAddress(0));
+    return {contents + start, length};
   };
-  return NewStringFromUtf8Variant(isolate(), peek_bytes, utf8_variant,
-                                  SharedStringBuilder{},
-                                  AllocationType::kSharedOld);
+  if (config.dest_shared()) {
+    return NewStringFromUtf8Variant(isolate(), peek_bytes, config.variant(),
+                                    SharedStringBuilder{},
+                                    AllocationType::kSharedOld);
+  }
+  return NewStringFromUtf8Variant(isolate(), peek_bytes, config.variant(),
+                                  StringBuilder{}, AllocationType::kYoung);
 }
 
 MaybeHandle<String> Factory::NewStringFromUtf8(
@@ -1089,54 +1091,38 @@ struct Wtf16Decoder {
 
 MaybeDirectHandle<String> Factory::NewStringFromUtf16(
     DirectHandle<WasmArray> array, uint32_t start, uint32_t end,
-    AllocationType allocation) {
+    UnicodeConfig config) {
   DCHECK_EQ(sizeof(uint16_t),
             WasmArray::DecodeElementSizeFromMap(array->map()));
   DCHECK_LE(start, end);
   DCHECK_LE(end, array->length());
   // {end - start} can never be more than what the Utf8Decoder can handle.
   static_assert(WasmArray::MaxLength(sizeof(uint16_t)) <= kMaxInt);
-  auto peek_bytes = [&]() -> base::Vector<const uint16_t> {
-    const uint16_t* contents =
-        reinterpret_cast<const uint16_t*>(array->ElementAddress(0));
-    return {contents + start, end - start};
-  };
-  return NewStringFromBytes<Wtf16Decoder, decltype(peek_bytes),
-                            NonSharedStringPolicy>(
-      isolate(), peek_bytes, allocation, MessageTemplate::kNone);
-}
-
-MaybeDirectHandle<String> Factory::NewSharedStringFromUtf16(
-    DirectHandle<WasmArray> array, uint32_t start, uint32_t end) {
-  DCHECK_EQ(sizeof(uint16_t),
-            WasmArray::DecodeElementSizeFromMap(array->map()));
-  DCHECK_LE(start, end);
-  DCHECK_LE(end, array->length());
-  // {end - start} can never be more than what the Utf8Decoder can handle.
-  static_assert(WasmArray::MaxLength(sizeof(uint16_t)) <= kMaxInt);
-
-  // We need a private copy of the array's contents. We have a pass that
-  // checks whether the string is one-byte and one that copies the bytes,
-  // and we cannot afford to have concurrent modifications to the array between
-  // those.
 
   uint32_t length = end - start;
-  const base::Atomic16* contents =
-      reinterpret_cast<base::Atomic16*>(array->ElementAddress(start));
-  auto private_copy = base::OwnedVector<uint16_t>::NewForOverwrite(length);
-
-  for (uint32_t i = 0; i < length; i++) {
-    auto dest = reinterpret_cast<base::Atomic16*>(private_copy.data() + i);
-    base::Relaxed_Store(dest, base::Relaxed_Load(contents + i));
+  base::OwnedVector<uint16_t> private_copy;
+  if (config.source_shared()) {
+    private_copy = CopyCodeUnits(
+        reinterpret_cast<const base::Atomic16*>(array->ElementAddress(start)),
+        length);
   }
-
   auto peek_bytes = [&]() -> base::Vector<const uint16_t> {
-    return private_copy.as_vector();
+    if (config.source_shared()) {
+      return private_copy.as_vector();
+    }
+    const uint16_t* contents =
+        reinterpret_cast<const uint16_t*>(array->ElementAddress(0));
+    return {contents + start, length};
   };
+  if (config.dest_shared()) {
+    return NewStringFromBytes<Wtf16Decoder, decltype(peek_bytes),
+                              SharedStringPolicy>(isolate(), peek_bytes,
+                                                  AllocationType::kSharedOld,
+                                                  MessageTemplate::kNone);
+  }
   return NewStringFromBytes<Wtf16Decoder, decltype(peek_bytes),
-                            SharedStringPolicy>(isolate(), peek_bytes,
-                                                AllocationType::kSharedOld,
-                                                MessageTemplate::kNone);
+                            NonSharedStringPolicy>(
+      isolate(), peek_bytes, AllocationType::kYoung, MessageTemplate::kNone);
 }
 
 MaybeDirectHandle<String> Factory::WasmStringAddShared(
@@ -1159,6 +1145,8 @@ MaybeDirectHandle<String> Factory::WasmStringAddShared(
     DirectHandle<SeqOneByteString> result =
         NewRawSharedOneByteString(length).ToHandleChecked();
     DisallowGarbageCollection no_gc;
+    SharedObjectConditionalSafePublishGuard publish_guard(*result,
+                                                          SharedFlag{true});
     SharedStringAccessGuardIfNeeded access_guard(isolate());
     uint8_t* dest = result->GetChars(no_gc, access_guard);
     {
@@ -1223,9 +1211,26 @@ MaybeDirectHandle<String> Factory::NewStringFromTwoByte(
 
 #if V8_ENABLE_WEBASSEMBLY
 MaybeDirectHandle<String> Factory::NewStringFromTwoByteLittleEndian(
-    base::Vector<const base::uc16> str, AllocationType allocation) {
+    base::Vector<const base::uc16> str, UnicodeConfig config) {
 #if defined(V8_TARGET_LITTLE_ENDIAN)
-  return NewStringFromTwoByte(str, allocation);
+  uint32_t length = static_cast<uint32_t>(str.length());
+  base::OwnedVector<uint16_t> private_copy;
+  if (config.source_shared()) {
+    private_copy = CopyCodeUnits(
+        reinterpret_cast<const base::Atomic16*>(str.data()), length);
+  }
+  auto peek_bytes = [&]() -> base::Vector<const uint16_t> {
+    return config.source_shared() ? private_copy.as_vector() : str;
+  };
+  if (config.dest_shared()) {
+    return NewStringFromBytes<Wtf16Decoder, decltype(peek_bytes),
+                              SharedStringPolicy>(isolate(), peek_bytes,
+                                                  AllocationType::kSharedOld,
+                                                  MessageTemplate::kNone);
+  }
+  return NewStringFromBytes<Wtf16Decoder, decltype(peek_bytes),
+                            NonSharedStringPolicy>(
+      isolate(), peek_bytes, AllocationType::kYoung, MessageTemplate::kNone);
 #elif defined(V8_TARGET_BIG_ENDIAN)
   // TODO(12868): Duplicate the guts of NewStringFromTwoByte, so that
   // copying and transcoding the data can be done in a single pass.
@@ -1431,6 +1436,8 @@ Handle<String> Factory::NewCopiedSubstringShared(DirectHandle<String> str,
     Handle<SeqOneByteString> result =
         NewRawSharedOneByteString(length).ToHandleChecked();
     DisallowGarbageCollection no_gc;
+    SharedObjectConditionalSafePublishGuard publish_guard(*result,
+                                                          SharedFlag{true});
     uint8_t* dest = result->GetChars(no_gc);
     String::WriteToFlat(*str, dest, begin, length);
     return result;
@@ -1438,6 +1445,8 @@ Handle<String> Factory::NewCopiedSubstringShared(DirectHandle<String> str,
     Handle<SeqTwoByteString> result =
         NewRawSharedTwoByteString(length).ToHandleChecked();
     DisallowGarbageCollection no_gc;
+    SharedObjectConditionalSafePublishGuard publish_guard(*result,
+                                                          SharedFlag{true});
     base::uc16* dest = result->GetChars(no_gc);
     String::WriteToFlat(*str, dest, begin, length);
     return result;
@@ -2184,18 +2193,9 @@ DirectHandle<WasmImportData> Factory::NewWasmImportData(
         *importing_instance_data.ToHandleChecked());
   }
   result->set_wrapper_budget(*wrapper_budget_cell);
-  result->clear_call_origin();
   result->set_sig(sig);
   result->clear_padding();
   return direct_handle(result, isolate());
-}
-
-DirectHandle<WasmImportData> Factory::NewWasmImportData(
-    DirectHandle<WasmImportData> import_data) {
-  return NewWasmImportData(
-      handle(import_data->callable(), isolate()), import_data->suspend(),
-      handle(import_data->importing_instance_data(), isolate()),
-      import_data->sig());
 }
 
 DirectHandle<WasmFastApiCallData> Factory::NewWasmFastApiCallData(
@@ -2320,7 +2320,6 @@ DirectHandle<WasmStackObject> Factory::NewWasmStackObject(
 }
 
 DirectHandle<WasmExportedFunctionData> Factory::NewWasmExportedFunctionData(
-    DirectHandle<Code> export_wrapper,
     DirectHandle<WasmTrustedInstanceData> instance_data,
     DirectHandle<WasmFuncRef> func_ref,
     DirectHandle<WasmInternalFunction> internal_function, int wrapper_budget,
@@ -2335,7 +2334,6 @@ DirectHandle<WasmExportedFunctionData> Factory::NewWasmExportedFunctionData(
   DisallowGarbageCollection no_gc;
   result->set_func_ref(*func_ref);
   result->set_internal(*internal_function);
-  result->set_wrapper_code(*export_wrapper);
   result->set_instance_data(*instance_data);
   result->set_function_index(func_index);
   result->set_wrapper_budget(*wrapper_budget_cell);
@@ -2352,8 +2350,7 @@ DirectHandle<WasmExportedFunctionData> Factory::NewWasmExportedFunctionData(
 
 DirectHandle<WasmCapiFunctionData> Factory::NewWasmCapiFunctionData(
     Address call_target, DirectHandle<CppGCManagedBase> embedder_data,
-    DirectHandle<Code> wrapper_code, DirectHandle<Map> rtt,
-    const wasm::CanonicalSig* sig) {
+    DirectHandle<Map> rtt, const wasm::CanonicalSig* sig) {
   DirectHandle<WasmImportData> import_data =
       NewWasmImportData(undefined_value(), wasm::kNoSuspend,
                         DirectHandle<WasmTrustedInstanceData>(), sig);
@@ -2372,7 +2369,6 @@ DirectHandle<WasmCapiFunctionData> Factory::NewWasmCapiFunctionData(
   DisallowGarbageCollection no_gc;
   result->set_func_ref(*func_ref);
   result->set_internal(*internal);
-  result->set_wrapper_code(*wrapper_code);
   result->set_embedder_data(*embedder_data);
   result->set_js_promise_flags(
       WasmFunctionData::SuspendField::encode(wasm::kNoSuspend) |
@@ -2404,9 +2400,9 @@ DirectHandle<WasmArray> Factory::NewWasmArray(wasm::ValueType element_type,
                                               DirectHandle<Map> map,
                                               AllocationType allocation,
                                               WriteBarrierMode write_barrier) {
-  SharedObjectConditionalSafePublishGuard publish_guard(allocation);
   Tagged<WasmArray> result = NewWasmArrayUninitialized(length, map, allocation);
   DisallowGarbageCollection no_gc;
+  SharedObjectConditionalSafePublishGuard publish_guard(result, allocation);
   if (element_type.is_numeric()) {
     if (initial_value.zero_byte_representation()) {
       memset(reinterpret_cast<void*>(result->ElementAddress(0)), 0,
@@ -2429,10 +2425,10 @@ DirectHandle<WasmArray> Factory::NewWasmArray(wasm::ValueType element_type,
 DirectHandle<WasmArray> Factory::NewWasmArrayFromElements(
     const wasm::ArrayType* type, base::Vector<wasm::WasmValue> elements,
     DirectHandle<Map> map, AllocationType allocation) {
-  SharedObjectConditionalSafePublishGuard publish_guard(allocation);
   uint32_t length = static_cast<uint32_t>(elements.size());
   Tagged<WasmArray> result = NewWasmArrayUninitialized(length, map, allocation);
   DisallowGarbageCollection no_gc;
+  SharedObjectConditionalSafePublishGuard publish_guard(result, allocation);
   if (type->element_type().is_numeric()) {
     for (uint32_t i = 0; i < length; i++) {
       Address address = result->ElementAddress(i);
@@ -2452,9 +2448,9 @@ DirectHandle<WasmArray> Factory::NewWasmArrayFromMemory(
     uint32_t length, DirectHandle<Map> map, AllocationType allocation,
     wasm::CanonicalValueType element_type, base::Vector<const uint8_t> source) {
   DCHECK(element_type.is_numeric());
-  SharedObjectConditionalSafePublishGuard publish_guard(allocation);
   Tagged<WasmArray> result = NewWasmArrayUninitialized(length, map, allocation);
   DisallowGarbageCollection no_gc;
+  SharedObjectConditionalSafePublishGuard publish_guard(result, allocation);
 #if V8_TARGET_BIG_ENDIAN
   MemCopyAndSwitchEndianness(reinterpret_cast<void*>(result->ElementAddress(0)),
                              source.data(), length,
@@ -2475,7 +2471,6 @@ DirectHandle<Object> Factory::NewWasmArrayFromElementSegment(
     DirectHandle<Map> map, AllocationType allocation,
     wasm::CanonicalValueType element_type) {
   DCHECK(element_type.is_ref());
-  SharedObjectConditionalSafePublishGuard publish_guard(allocation);
 
   // If the element segment has not been initialized yet, lazily initialize it
   // now.
@@ -2492,6 +2487,7 @@ DirectHandle<Object> Factory::NewWasmArrayFromElementSegment(
 
   Tagged<WasmArray> result = NewWasmArrayUninitialized(length, map, allocation);
   DisallowGarbageCollection no_gc;
+  SharedObjectConditionalSafePublishGuard publish_guard(result, allocation);
   if (length > 0) {
     WriteBarrierMode wb_mode = UPDATE_WRITE_BARRIER;
     if (allocation == AllocationType::kYoung) wb_mode = SKIP_WRITE_BARRIER;
@@ -2516,19 +2512,60 @@ Handle<WasmStruct> Factory::NewWasmStructUninitialized(
   return handle(result, isolate());
 }
 
+Handle<WasmCustomMap> Factory::NewWasmCustomMapUninitialized(
+    const wasm::StructType* descriptor,
+    wasm::CanonicalTypeIndex described_index, int described_size,
+    InstanceType described_instance_type, DirectHandle<Map> rtt_parent,
+    int num_supertypes, DirectHandle<Map> map) {
+  const SharedFlag shared = descriptor->is_shared();
+
+  const wasm::CanonicalValueType no_array_element = wasm::kWasmBottom;
+  // If we had a CanonicalHeapType, we could use that here.
+  wasm::CanonicalValueType heaptype = wasm::CanonicalValueType::Ref(
+      described_index, shared, wasm::RefTypeKind::kStruct);
+  DirectHandle<WasmTypeInfo> type_info = NewWasmTypeInfo(
+      heaptype, no_array_element, rtt_parent, num_supertypes, shared);
+
+  AllocationType allocation =
+      shared ? AllocationType::kSharedMap : AllocationType::kMap;
+  AllocationAlignment alignment = shared ? kDoubleAligned : kTaggedAligned;
+  const int descriptor_size = WasmCustomMap::Size(descriptor);
+  DCHECK_EQ(descriptor_size, WasmStruct::DecodeInstanceSizeFromMap(*map));
+  Tagged<HeapObject> raw = AllocateRaw(descriptor_size, allocation, alignment);
+  raw->set_map_after_allocation(isolate(), *map);
+  Tagged<WasmCustomMap> result = Cast<WasmCustomMap>(raw);
+  const int inobject_properties = 0;
+  // If NO_ELEMENTS were supported, we could use that here.
+  const ElementsKind elements_kind = TERMINAL_FAST_ELEMENTS_KIND;
+  ReadOnlyRoots roots(isolate());
+  InitializeMap(result, described_instance_type, kVariableSizeSentinel,
+                elements_kind, inobject_properties, roots);
+  result->set_native_context_for_wrapper(isolate()->raw_native_context());
+  result->set_wasm_type_info(*type_info);
+  result->set_is_extensible(false);
+  result->set_immediate_supertype_map(*rtt_parent);
+  result->set_js_wrapper(*null_value());
+  WasmStruct::EncodeInstanceSizeInMap(described_size, result);
+  isolate()->counters()->maps_created()->Increment();
+  return handle(result, isolate());
+}
+
+// TODO(jkummerow): Replace with ...Uninitialized variant.
 DirectHandle<WasmStruct> Factory::NewWasmStruct(const wasm::StructType* type,
                                                 wasm::WasmValue* args,
                                                 DirectHandle<Map> map) {
-  SharedObjectConditionalSafePublishGuard publish_guard(type->is_shared());
   AllocationAlignment alignment =
       type->is_shared() ? kDoubleAligned : kTaggedAligned;
   Tagged<HeapObject> raw = AllocateRaw(
       WasmStruct::Size(type),
       type->is_shared() ? AllocationType::kSharedOld : AllocationType::kYoung,
       alignment);
+  DisallowGarbageCollection no_gc;
   raw->set_map_after_allocation(isolate(), *map);
   Tagged<WasmStruct> result = Cast<WasmStruct>(raw);
   result->set_raw_properties_or_hash(*empty_fixed_array(), kRelaxedStore);
+  SharedObjectConditionalSafePublishGuard publish_guard(result,
+                                                        type->is_shared());
   for (uint32_t i = 0; i < type->field_count(); i++) {
     int offset = type->field_offset(i);
     if (type->field(i).is_numeric()) {
@@ -2693,7 +2730,6 @@ Handle<Map> Factory::NewMapImpl(MetaMapProviderFunc&& meta_map_provider,
                                 int instance_size, ElementsKind elements_kind,
                                 int inobject_properties,
                                 AllocationType allocation_type) {
-  SharedObjectConditionalSafePublishGuard publish_guard(allocation_type);
   static_assert(LAST_JS_OBJECT_TYPE == LAST_TYPE);
   DCHECK(!InstanceTypeChecker::MayHaveMapCheckFastCase(type));
   DCHECK_IMPLIES(InstanceTypeChecker::IsJSObject(type) &&
@@ -2867,6 +2903,7 @@ DirectHandle<Map> Factory::NewContextfulMap(
   DCHECK(InstanceTypeChecker::IsNativeContextSpecific(type) ||
 #if V8_ENABLE_WEBASSEMBLY
          InstanceTypeChecker::IsWasmStruct(type) ||
+         InstanceTypeChecker::IsWasmCustomMap(type) ||
 #endif  // V8_ENABLE_WEBASSEMBLY
          InstanceTypeChecker::IsMap(type));
   auto meta_map_provider = [native_context] {
@@ -5400,7 +5437,10 @@ Factory::JSFunctionBuilder::JSFunctionBuilder(
     : isolate_(isolate), sfi_(sfi), context_(context) {}
 
 Handle<JSFunction> Factory::JSFunctionBuilder::Build() {
-  DirectHandle<Code> code(sfi_->GetCode(isolate_), isolate_);
+  DirectHandle<Code> code;
+  if (!maybe_code_.ToHandle(&code)) {
+    code = direct_handle(sfi_->GetCode(isolate_), isolate_);
+  }
   // Retain the code across the call to BuildRaw, because it allocates and can
   // trigger code to be flushed. Otherwise the SFI's compiled state and the
   // function's compiled state can diverge, and the call to PostInstantiation
@@ -5564,9 +5604,10 @@ JSDispatchHandle Factory::NewJSDispatchHandle(uint16_t parameter_count,
                                               DirectHandle<Code> code,
                                               JSDispatchTable::Space* space) {
 #ifdef V8_ENABLE_ALLOCATION_TIMEOUT
-  if (v8_flags.dispatch_table_gc_interval > 0) [[unlikely]] {
+  const int gc_interval = isolate()->heap()->dispatch_table_gc_interval();
+  if (gc_interval > 0) [[unlikely]] {
     if (isolate()->heap()->increment_dispatch_table_allocations() %
-            v8_flags.dispatch_table_gc_interval ==
+            gc_interval ==
         0) {
       isolate()->heap()->CollectAllGarbage(GCFlag::kNoFlags,
                                            GarbageCollectionReason::kTesting);

@@ -88,8 +88,9 @@ bool IsMutableMap(InstanceType instance_type, ElementsKind elements_kind) {
       InstanceTypeChecker::IsAlwaysSharedSpaceJSObject(instance_type);
   bool is_wasm_object = false;
 #if V8_ENABLE_WEBASSEMBLY
-  is_wasm_object =
-      instance_type == WASM_STRUCT_TYPE || instance_type == WASM_ARRAY_TYPE;
+  is_wasm_object = instance_type == WASM_STRUCT_TYPE ||
+                   instance_type == WASM_CUSTOM_MAP_TYPE ||
+                   instance_type == WASM_ARRAY_TYPE;
 #endif  // V8_ENABLE_WEBASSEMBLY
   DCHECK_IMPLIES(is_js_object &&
                      !Map::CanHaveFastTransitionableElementsKind(instance_type),
@@ -1413,6 +1414,12 @@ bool Heap::CreateReadOnlyObjects() {
   set_property_cell_hole_value(UncheckedCast<PropertyCellHole>(make_hole()));
   set_hash_table_hole_value(UncheckedCast<HashTableHole>(make_hole()));
   set_promise_hole_value(UncheckedCast<PromiseHole>(make_hole()));
+#ifdef V8_ENABLE_TDZ_HOLE
+  set_tdz_hole_value(UncheckedCast<TdzHole>(make_hole()));
+#else
+  // TODO(leszeks): Remove DisabledTdzHole when v8_enable_tdz_hole is removed.
+  set_disabled_tdz_hole_value(UncheckedCast<DisabledTdzHole>(make_hole()));
+#endif
   set_uninitialized_value(UncheckedCast<UninitializedHole>(make_hole()));
   set_arguments_marker(UncheckedCast<ArgumentsMarker>(make_hole()));
   set_termination_exception(UncheckedCast<TerminationException>(make_hole()));
@@ -1481,9 +1488,8 @@ void Heap::CreateInitialMutableObjects() {
   // Allocate regexp caches.
   set_string_split_cache(*factory->NewFixedArray(
       regexp::ResultsCache::kRegExpResultsCacheSize, AllocationType::kOld));
-  set_regexp_split_cache(*factory->NewFixedArray(
-      regexp::ResultsCache::kRegExpSplitResultsCacheSize,
-      AllocationType::kOld));
+  // Allocated on first use, see EnsureRegExpSplitCache.
+  set_regexp_split_cache(roots.empty_fixed_array());
   set_regexp_multiple_cache(*factory->NewFixedArray(
       regexp::ResultsCache::kRegExpResultsCacheSize, AllocationType::kOld));
   set_regexp_match_global_atom_cache(*factory->NewFixedArray(

@@ -56,6 +56,9 @@ int MacroAssembler::RequiredStackSizeForCallerSaved(SaveFPRegsMode fp_mode,
 
   if (fp_mode == SaveFPRegsMode::kSave) {
     bytes += kCallerSavedFPU.Count() * kDoubleSize;
+#if V8_ENABLE_SIMD128
+    bytes += kCallerSavedVR.Count() * kSimd128Size;
+#endif
   }
 
   return bytes;
@@ -73,6 +76,14 @@ int MacroAssembler::PushCallerSaved(SaveFPRegsMode fp_mode, Register exclusion1,
   if (fp_mode == SaveFPRegsMode::kSave) {
     MultiPushFPU(kCallerSavedFPU);
     bytes += kCallerSavedFPU.Count() * kDoubleSize;
+#if V8_ENABLE_SIMD128
+    // The vector registers are a separate register file from the FPU
+    // registers, so they must be saved independently. SaveVectorRegisters
+    // takes care of only accessing vector registers if the hardware supports
+    // SIMD, reserving the same amount of stack space in either case.
+    SaveVectorRegisters(kCallerSavedVR);
+    bytes += kCallerSavedVR.Count() * kSimd128Size;
+#endif
   }
 
   return bytes;
@@ -82,6 +93,10 @@ int MacroAssembler::PopCallerSaved(SaveFPRegsMode fp_mode, Register exclusion1,
                                    Register exclusion2, Register exclusion3) {
   int bytes = 0;
   if (fp_mode == SaveFPRegsMode::kSave) {
+#if V8_ENABLE_SIMD128
+    RestoreVectorRegisters(kCallerSavedVR);
+    bytes += kCallerSavedVR.Count() * kSimd128Size;
+#endif
     MultiPopFPU(kCallerSavedFPU);
     bytes += kCallerSavedFPU.Count() * kDoubleSize;
   }
@@ -141,10 +156,7 @@ void MacroAssembler::GenerateTailCallToReturnedCode(
     Push(kJavaScriptCallTargetRegister, kJavaScriptCallNewTargetRegister,
          kJavaScriptCallArgCountRegister);
 #ifdef V8_JS_LINKAGE_INCLUDES_DISPATCH_HANDLE
-    // No need to SmiTag since dispatch handles always look like Smis.
-    static_assert(kJSDispatchHandleShift > 0);
-    AssertSmi(kJavaScriptCallDispatchHandleRegister);
-    Push(kJavaScriptCallDispatchHandleRegister);
+    PushDispatchHandle(kJavaScriptCallDispatchHandleRegister, a5, a6);
 #endif
     // Function is also the parameter to the runtime call.
     Push(kJavaScriptCallTargetRegister);
@@ -154,7 +166,7 @@ void MacroAssembler::GenerateTailCallToReturnedCode(
     // Restore target function, new target, actual argument count and dispatch
     // handle.
 #ifdef V8_JS_LINKAGE_INCLUDES_DISPATCH_HANDLE
-    Pop(kJavaScriptCallDispatchHandleRegister);
+    PopDispatchHandle(kJavaScriptCallDispatchHandleRegister, a5, a6);
 #endif
     Pop(kJavaScriptCallTargetRegister, kJavaScriptCallNewTargetRegister,
         kJavaScriptCallArgCountRegister);
@@ -200,6 +212,13 @@ void MacroAssembler::LoadTaggedRoot(Register destination, RootIndex index) {
   }
   LoadWord(destination,
            MemOperand(kRootRegister, RootRegisterOffsetForRootIndex(index)));
+}
+void MacroAssembler::StoreTaggedRoot(const MemOperand& destination,
+                                     RootIndex index) {
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
+  LoadTaggedRoot(scratch, index);
+  StoreTaggedField(scratch, destination);
 }
 void MacroAssembler::LoadCompressedTaggedRoot(Register destination,
                                               RootIndex index) {
@@ -792,23 +811,14 @@ void MacroAssembler::RecordWrite(Register object, Operand offset,
 // ---------------------------------------------------------------------------
 // Instruction macros.
 #if V8_TARGET_ARCH_RISCV64
-void MacroAssembler::DecodeSandboxedPointer(Register value) {
-  ASM_CODE_COMMENT(this);
-#ifdef V8_ENABLE_SANDBOX
-  SrlWord(value, value, kSandboxedPointerShift);
-  AddWord(value, value, kPtrComprCageBaseRegister);
-#else
-  UNREACHABLE();
-#endif
-}
-
 void MacroAssembler::LoadSandboxedPointerField(Register destination,
                                                const MemOperand& field_operand,
                                                Trapper&& trapper) {
 #ifdef V8_ENABLE_SANDBOX
   ASM_CODE_COMMENT(this);
   LoadWord(destination, field_operand, std::forward<Trapper>(trapper));
-  DecodeSandboxedPointer(destination);
+  SrlWord(destination, destination, kSandboxedPointerShift);
+  AddWord(destination, kPtrComprCageBaseRegister, destination);
 #else
   UNREACHABLE();
 #endif
@@ -4601,20 +4611,38 @@ void MacroAssembler::CompareTaggedAndBranch(Label* label, Condition cond,
 #if V8_TARGET_ARCH_RISCV64
     UseScratchRegisterScope temps(this);
     Register scratch0 = temps.Acquire();
-    SignExtendWord(scratch0, r1);
-    if (IsZero(r2)) {
+    if (cond == eq || cond == ne) {
+      // Equality only depends on the low 32 bits, and a 32-bit subtraction
+      // sign-extends its result, so it is zero exactly when those low 32 bits
+      // match. This avoids sign-extending both operands first.
+      if (r2.is_reg()) {
+        Sub32(scratch0, r1, r2);
+      } else if (MustUseReg(r2.rmode())) {
+        // A relocatable immediate (e.g. a Handle<HeapObject>) is a handle
+        // location, not the value to compare against; materialize it first
+        // so the relocation is recorded and the real value is compared.
+        li(scratch0, r2);
+        Sub32(scratch0, r1, scratch0);
+      } else {
+        Sub32(scratch0, r1, Operand(static_cast<int32_t>(r2.immediate())));
+      }
       Branch(label, cond, scratch0, Operand(zero_reg));
     } else {
-      Register scratch1 = temps.Acquire();
-      if (r2.is_reg()) {
-        SignExtendWord(scratch1, r2.rm());
+      SignExtendWord(scratch0, r1);
+      if (IsZero(r2)) {
+        Branch(label, cond, scratch0, Operand(zero_reg));
       } else {
-        li(scratch1, r2);
-        if (!base::IsInRange(r2.immediate(), 0, 0x7FFFFFFF)) {
-          SignExtendWord(scratch1, scratch1);
+        Register scratch1 = temps.Acquire();
+        if (r2.is_reg()) {
+          SignExtendWord(scratch1, r2.rm());
+        } else {
+          li(scratch1, r2);
+          if (!base::IsInRange(r2.immediate(), 0, 0x7FFFFFFF)) {
+            SignExtendWord(scratch1, scratch1);
+          }
         }
+        Branch(label, cond, scratch0, Operand(scratch1));
       }
-      Branch(label, cond, scratch0, Operand(scratch1));
     }
 #else
     UNREACHABLE();
@@ -5870,8 +5898,8 @@ void MacroAssembler::InvokeFunctionCode(
   DCHECK_IMPLIES(new_target.is_valid(), new_target == a3);
 
   Register dispatch_handle = kJavaScriptCallDispatchHandleRegister;
-  Lw(dispatch_handle,
-     FieldMemOperand(function, offsetof(JSFunction, dispatch_handle_)));
+  Load32U(dispatch_handle,
+          FieldMemOperand(function, offsetof(JSFunction, dispatch_handle_)));
 
   // On function call, call into the debugger if necessary.
   Label debug_hook, continue_after_hook;
@@ -7618,8 +7646,8 @@ void MacroAssembler::CallJSFunction(Register function_object,
   Register parameter_count = s1;
   UseScratchRegisterScope temps(this);
   Register scratch = temps.Acquire();
-  Lw(dispatch_handle,
-     FieldMemOperand(function_object, offsetof(JSFunction, dispatch_handle_)));
+  Lwu(dispatch_handle,
+      FieldMemOperand(function_object, offsetof(JSFunction, dispatch_handle_)));
   LoadEntrypointAndParameterCountFromJSDispatchTable(code, parameter_count,
                                                      dispatch_handle, scratch);
   // Force a safe crash if the parameter count doesn't match.
@@ -7647,6 +7675,10 @@ void MacroAssembler::CallJSDispatchEntry(JSDispatchHandle dispatch_handle,
   Register scratch = s1;
   li(kJavaScriptCallDispatchHandleRegister,
      Operand(dispatch_handle.value(), RelocInfo::JS_DISPATCH_HANDLE));
+#ifdef V8_TARGET_ARCH_RISCV64
+  ZeroExtendWord(kJavaScriptCallDispatchHandleRegister,
+                 kJavaScriptCallDispatchHandleRegister);
+#endif
   LoadEntrypointFromJSDispatchTable(code, kJavaScriptCallDispatchHandleRegister,
                                     scratch);
   CHECK_EQ(argument_count,
@@ -7759,7 +7791,8 @@ void MacroAssembler::LoadEntrypointFromJSDispatchTable(Register destination,
   static_assert(kJSDispatchHandleShift == 0);
   SllWord(index, dispatch_handle, kJSDispatchTableEntrySizeLog2);
 #else
-  SrlWord(index, dispatch_handle, kJSDispatchHandleShift);
+  ZeroExtendWord(index, dispatch_handle);
+  SrlWord(index, index, kJSDispatchHandleShift);
   SllWord(index, index, kJSDispatchTableEntrySizeLog2);
 #endif
   AddWord(scratch, scratch, index);
@@ -7851,7 +7884,8 @@ void MacroAssembler::LoadParameterCountFromJSDispatchTable(
   DCHECK(!AreAliased(destination, scratch));
   ASM_CODE_COMMENT(this);
   Register index = destination;
-  SrlWord(index, dispatch_handle, kJSDispatchHandleShift);
+  ZeroExtendWord(index, dispatch_handle);
+  SrlWord(index, index, kJSDispatchHandleShift);
   SllWord(index, index, kJSDispatchTableEntrySizeLog2);
   Ld(scratch, ExternalReferenceAsOperand(IsolateFieldId::kJSDispatchTable));
   AddWord(scratch, scratch, index);
@@ -7866,12 +7900,41 @@ void MacroAssembler::LoadEntrypointAndParameterCountFromJSDispatchTable(
   ASM_CODE_COMMENT(this);
   Register index = parameter_count;
   Ld(scratch, ExternalReferenceAsOperand(IsolateFieldId::kJSDispatchTable));
-  SrlWord(index, dispatch_handle, kJSDispatchHandleShift);
+  ZeroExtendWord(index, dispatch_handle);
+  SrlWord(index, index, kJSDispatchHandleShift);
   SllWord(index, index, kJSDispatchTableEntrySizeLog2);
   AddWord(scratch, scratch, index);
   LoadWord(entrypoint, MemOperand(scratch, JSDispatchEntry::kEntrypointOffset));
   static_assert(JSDispatchEntry::kParameterCountMask == 0xffff);
   Lhu(parameter_count, MemOperand(scratch, JSDispatchEntry::kCodeObjectOffset));
+}
+
+void MacroAssembler::PushDispatchHandle(Register dispatch_handle,
+                                        Register scratch1, Register scratch2) {
+  DCHECK(!AreAliased(dispatch_handle, scratch1, scratch2));
+#ifdef V8_ENABLE_SANDBOX
+  AssertZeroExtended(dispatch_handle);
+  LoadParameterCountFromJSDispatchTable(scratch1, dispatch_handle, scratch2);
+  ZeroExtendWord(dispatch_handle, dispatch_handle);
+  slli(scratch1, scratch1, 32);
+  or_(dispatch_handle, dispatch_handle, scratch1);
+#endif
+  Push(dispatch_handle);
+  // No need to SmiTag since dispatch handles always look like Smis.
+  static_assert(kJSDispatchHandleShift > 0);
+  AssertSmi(dispatch_handle);
+}
+
+void MacroAssembler::PopDispatchHandle(Register dispatch_handle,
+                                       Register scratch1, Register scratch2) {
+  DCHECK(!AreAliased(dispatch_handle, scratch1, scratch2));
+  Pop(dispatch_handle);
+#ifdef V8_ENABLE_SANDBOX
+  LoadParameterCountFromJSDispatchTable(scratch1, dispatch_handle, scratch2);
+  srli(scratch2, dispatch_handle, 32);
+  ZeroExtendWord(dispatch_handle, dispatch_handle);
+  SbxCheck(eq, AbortReason::kJSSignatureMismatch, scratch1, Operand(scratch2));
+#endif
 }
 
 void MacroAssembler::LoadTaggedField(const Register& destination,
@@ -7948,23 +8011,19 @@ void MacroAssembler::DecompressTagged(const Register& destination,
                                       Trapper&& trapper) {
   ASM_CODE_COMMENT(this);
   Lwu(destination, field_operand, std::forward<Trapper>(trapper));
-  AddWord(destination, kPtrComprCageBaseRegister, destination);
+  Or(destination, kPtrComprCageBaseRegister, destination);
 }
 
 void MacroAssembler::DecompressTagged(const Register& destination,
                                       const Register& source) {
   ASM_CODE_COMMENT(this);
-  if (CpuFeatures::IsSupported(ZBA)) {
-    adduw(destination, source, kPtrComprCageBaseRegister);
-  } else {
-    ZeroExtendWord(destination, source);
-    AddWord(destination, kPtrComprCageBaseRegister, Operand(destination));
-  }
+  ZeroExtendWord(destination, source);
+  Or(destination, kPtrComprCageBaseRegister, destination);
 }
 
 void MacroAssembler::DecompressTagged(Register dst, Tagged_t immediate) {
   ASM_CODE_COMMENT(this);
-  AddWord(dst, kPtrComprCageBaseRegister, static_cast<int32_t>(immediate));
+  Or(dst, kPtrComprCageBaseRegister, Operand(static_cast<uint32_t>(immediate)));
 }
 
 void MacroAssembler::DecompressProtected(const Register& destination,
@@ -8004,7 +8063,7 @@ void MacroAssembler::AtomicDecompressTagged(Register dst, const MemOperand& src,
   ASM_CODE_COMMENT(this);
   Lwu(dst, src, std::forward<Trapper>(trapper));
   sync();
-  AddWord(dst, kPtrComprCageBaseRegister, dst);
+  Or(dst, kPtrComprCageBaseRegister, dst);
 }
 
 #endif

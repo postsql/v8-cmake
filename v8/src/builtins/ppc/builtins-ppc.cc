@@ -359,7 +359,7 @@ void Generate_JSBuiltinsConstructStubHelper(MacroAssembler* masm) {
     Generate_PushArguments(masm, r7, r3, r8, ArgumentsElementType::kRaw);
 
     // The receiver for the builtin/api call.
-    __ PushRoot(RootIndex::kTheHoleValue);
+    __ PushRoot(RootIndex::kTdzHoleValue);
 
     // Call the function.
     // r3: number of arguments (untagged)
@@ -527,9 +527,9 @@ void Builtins::Generate_JSConstructStubGeneric(MacroAssembler* masm) {
   __ CallBuiltin(Builtin::kFastNewObject);
   __ b(&post_instantiation_deopt_entry);
 
-  // Else: use TheHoleValue as receiver for constructor call
+  // Else: use TdzHoleValue as receiver for constructor call
   __ bind(&not_create_implicit_receiver);
-  __ LoadRoot(r3, RootIndex::kTheHoleValue);
+  __ LoadRoot(r3, RootIndex::kTdzHoleValue);
 
   // ----------- S t a t e -------------
   //  --                          r3: receiver
@@ -607,7 +607,7 @@ void Builtins::Generate_JSConstructStubGeneric(MacroAssembler* masm) {
   // on-stack receiver as the result.
   __ bind(&use_receiver);
   __ LoadU64(r3, MemOperand(sp));
-  __ JumpIfRoot(r3, RootIndex::kTheHoleValue, &do_throw);
+  __ JumpIfRoot(r3, RootIndex::kTdzHoleValue, &do_throw);
 
   __ bind(&leave_and_return);
   // Restore arguments count from the frame.
@@ -1841,7 +1841,7 @@ void Builtins::Generate_InterpreterPushArgsThenFastConstructFunction(
   FrameScope scope(masm, StackFrame::MANUAL);
   __ EnterFrame(StackFrame::FAST_CONSTRUCT);
   // Implicit receiver stored in the construct frame.
-  __ LoadRoot(r5, RootIndex::kTheHoleValue);
+  __ LoadRoot(r5, RootIndex::kTdzHoleValue);
   __ Push(cp, r5);
 
   // Push arguments + implicit receiver.
@@ -1908,7 +1908,7 @@ void Builtins::Generate_InterpreterPushArgsThenFastConstructFunction(
   __ bind(&use_receiver);
   __ LoadU64(
       r3, MemOperand(fp, FastConstructFrameConstants::kImplicitReceiverOffset));
-  __ JumpIfRoot(r3, RootIndex::kTheHoleValue, &do_throw);
+  __ JumpIfRoot(r3, RootIndex::kTdzHoleValue, &do_throw);
 
   __ bind(&leave_and_return);
   // Leave construct frame.
@@ -3275,6 +3275,7 @@ void SwitchStacks(MacroAssembler* masm, ExternalReference fn,
 void ReloadParentStack(MacroAssembler* masm, Register return_reg,
                        Register return_value, Register context, Register tmp1,
                        Register tmp2, Register tmp3) {
+  DCHECK(!AreAliased(tmp1, tmp2, tmp3));
   Register active_stack = tmp1;
   __ LoadRootRelative(active_stack, IsolateData::active_stack_offset());
 
@@ -3287,7 +3288,10 @@ void ReloadParentStack(MacroAssembler* masm, Register return_reg,
   // Switch stack!
   SwitchStacks(masm, ExternalReference::wasm_return_jspi_stack(), parent,
                nullptr, no_reg, {return_reg, return_value, context, parent});
+  __ LoadU64(tmp1, MemOperand(parent, wasm::kStackPcOffset));
   LoadJumpBuffer(masm, parent, false, tmp3);
+  __ StoreU64(
+      tmp1, MemOperand(fp, WasmJspiFrameConstants::kParentReturnAddressOffset));
 }
 
 void RestoreParentSuspender(MacroAssembler* masm, Register tmp1) {
@@ -3531,6 +3535,9 @@ namespace {
 // forwards the value, the onRejected variant throws the value.
 
 void Generate_WasmResumeHelper(MacroAssembler* masm, wasm::OnResume on_resume) {
+  __ CmpS64(kJavaScriptCallArgCountRegister, Operand(JSParameterCount(1)));
+  __ Check(eq, AbortReason::kJSSignatureMismatch);
+
   auto regs = RegisterAllocator::WithAllocatableGeneralRegisters();
   __ EnterFrame(StackFrame::WASM_JSPI);
 
@@ -3989,6 +3996,10 @@ void SwitchBackAndReturnPromise(MacroAssembler* masm, RegisterAllocator& regs,
   FREE_REG(promise);
   FREE_REG(return_value);
   __ bind(return_promise);
+  // The initial wrapper and a resume callback have different argument cleanup.
+  __ LoadU64(
+      tmp, MemOperand(fp, WasmJspiFrameConstants::kParentReturnAddressOffset));
+  __ Jump(tmp);
 }
 
 void GenerateExceptionHandlingLandingPad(MacroAssembler* masm,
@@ -4223,6 +4234,7 @@ void JSToWasmWrapperHelper(MacroAssembler* masm, wasm::Promise mode) {
   Label return_promise;
   if (stack_switch) {
     SwitchBackAndReturnPromise(masm, regs, mode, &return_promise);
+    __ Trap();  // Unreachable.
   }
   __ bind(&suspend);
 

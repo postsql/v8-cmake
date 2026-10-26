@@ -675,8 +675,7 @@ class WasmOutOfLineTrap : public OutOfLineCode {
     // Just encode the stub index. This will be patched when the code
     // is added to the native module and copied into wasm code space.
     __ near_call(static_cast<Address>(trap_id), RelocInfo::WASM_STUB_CALL);
-    ReferenceMap* reference_map = gen_->zone()->New<ReferenceMap>(gen_->zone());
-    gen_->RecordSafepoint(reference_map);
+    gen_->RecordSafepointWithoutTaggedSlots();
     __ AssertUnreachable(AbortReason::kUnexpectedReturnFromWasmTrap);
   }
 
@@ -687,8 +686,7 @@ void RecordTrapInfoIfNeeded(Zone* zone, CodeGenerator* codegen,
                             InstructionCode opcode, Instruction* instr,
                             int pc) {
   const MemoryAccessMode access_mode = instr->memory_access_mode();
-  if (access_mode == kMemoryAccessTrappingMemOutOfBounds ||
-      access_mode == kMemoryAccessTrappingNullDereference) {
+  if (access_mode == kMemoryAccessTrapping) {
     codegen->RecordTrappingInstruction(pc);
   }
 }
@@ -2087,7 +2085,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       RecordWriteMode mode = RecordWriteModeField::decode(instr->opcode());
       // Indirect pointer writes must use a different opcode.
       DCHECK_NE(mode, RecordWriteMode::kValueIsIndirectPointer);
-      AtomicMemoryOrder order = AtomicMemoryOrderField::decode(instr->opcode());
       Register object = i.InputRegister(0);
       size_t index = 0;
       Operand operand = i.MemoryOperand(&index);
@@ -2111,6 +2108,8 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
                            MachineRepresentation::kTagged, instr);
       } else {
         DCHECK_EQ(arch_opcode, kArchAtomicStoreWithWriteBarrier);
+        AtomicMemoryOrder order =
+            AtomicMemoryOrderField::decode(instr->opcode());
         EmitTSANAwareStore(zone(), this, masm(), operand, value, i,
                            DetermineStubCallMode(),
                            MachineRepresentation::kTagged, instr, order);
@@ -2139,7 +2138,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       size_t index = 0;
       Operand operand = i.MemoryOperand(&index);
       Register value = i.InputRegister(index);
-      AtomicMemoryOrder order = AtomicMemoryOrderField::decode(instr->opcode());
 
       DCHECK(v8_flags.verify_write_barriers);
       auto ool = zone()->New<OutOfLineVerifySkippedWriteBarrier>(
@@ -2154,6 +2152,8 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
                            MachineRepresentation::kTagged, instr);
       } else {
         DCHECK_EQ(arch_opcode, kArchAtomicStoreSkippedWriteBarrier);
+        AtomicMemoryOrder order =
+            AtomicMemoryOrderField::decode(instr->opcode());
         EmitTSANAwareStore(zone(), this, masm(), operand, value, i,
                            DetermineStubCallMode(),
                            MachineRepresentation::kTagged, instr, order);
@@ -2299,6 +2299,40 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kX64Sub128:
       ASSEMBLE_BINOP_WIDE(subq, sbbq);
       break;
+    case kX64Add64_3: {
+      DCHECK_EQ(i.InputRegister(0), i.OutputRegister(0));
+      size_t last_input_index = instr->InputCount() - 1;
+      DCHECK(HasRegisterInput(instr, last_input_index));
+      Register carry_in = i.InputRegister(last_input_index);
+      Register out_low = i.OutputRegister(0);
+      Register out_high = no_reg;
+      bool use_out_high = instr->OutputCount() > 1;
+      if (use_out_high) {
+        out_high = i.OutputRegister(1);
+        DCHECK_NE(out_high, out_low);
+        for (size_t j = 0; j < instr->InputCount(); ++j) {
+          if (HasRegisterInput(instr, j)) {
+            DCHECK_NE(i.InputRegister(j), out_high);
+          }
+        }
+        // GCC style: just addc, no setcc.
+        __ xorq(out_high, out_high);
+      }
+
+      size_t index = 1;
+      if (HasAddressingMode(instr)) {
+        Operand b = i.MemoryOperand(&index);
+        __ addq(out_low, b);
+      } else {
+        ASSEMBLE_RHS(addq, out_low, index);
+      }
+      DCHECK_EQ(index, last_input_index);
+      if (use_out_high) __ adcq(out_high, Immediate(0));
+      __ addq(out_low, carry_in);
+      if (use_out_high) __ adcq(out_high, Immediate(0));
+      break;
+    }
+
     case kX64And32:
       ASSEMBLE_BINOP(andl);
       break;
@@ -3535,10 +3569,18 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kX64Movsh:
       if (instr->HasOutput()) {
         CpuFeatureScope f16c_scope(masm(), F16C);
-        CpuFeatureScope avx2_scope(masm(), AVX2);
-        RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
-        __ vpbroadcastw(i.OutputDoubleRegister(), i.MemoryOperand());
-        __ vcvtph2ps(i.OutputDoubleRegister(), i.OutputDoubleRegister());
+        XMMRegister dst = i.OutputDoubleRegister();
+        if (CpuFeatures::IsSupported(AVX2)) {
+          CpuFeatureScope avx2_scope(masm(), AVX2);
+          RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
+          __ vpbroadcastw(dst, i.MemoryOperand());
+        } else {
+          CpuFeatureScope avx_scope(masm(), AVX);
+          __ vxorps(dst, dst, dst);
+          RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
+          __ vpinsrw(dst, dst, i.MemoryOperand(), 0);
+        }
+        __ vcvtph2ps(dst, dst);
       } else {
         CpuFeatureScope f16c_scope(masm(), F16C);
         size_t index = 0;
@@ -5183,14 +5225,15 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
           }
           case LaneSize::kL64: {
             // I64x2ShrS
-            // TODO(zhin): there is vpsraq but requires AVX512
             XMMRegister dst = i.OutputSimd128Register();
             XMMRegister src = i.InputSimd128Register(0);
             if (HasImmediateInput(instr, 1)) {
               __ I64x2ShrS(dst, src, i.InputInt6(1), kScratchDoubleReg);
             } else {
-              __ I64x2ShrS(dst, src, i.InputRegister(1), kScratchDoubleReg,
-                           i.TempSimd128Register(0), kScratchRegister);
+              XMMRegister temp = UseAvx10_1() ? XMMRegister::no_reg()
+                                              : i.TempSimd128Register(0);
+              __ I64x2ShrS(dst, src, i.InputRegister(1), temp,
+                           kScratchDoubleReg, kScratchRegister);
             }
             break;
           }
@@ -5361,9 +5404,10 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
           }
           case LaneSize::kL64: {
             // I64x2Mul
+            XMMRegister temp =
+                UseAvx10_1() ? XMMRegister::no_reg() : i.TempSimd128Register(0);
             __ I64x2Mul(i.OutputSimd128Register(), i.InputSimd128Register(0),
-                        i.InputSimd128Register(1), i.TempSimd128Register(0),
-                        kScratchDoubleReg);
+                        i.InputSimd128Register(1), temp, kScratchDoubleReg);
             break;
           }
           default:
@@ -5383,9 +5427,10 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
           }
           case LaneSize::kL64: {
             // I64x4Mul
+            YMMRegister temp =
+                UseAvx10_1() ? YMMRegister::no_reg() : i.TempSimd256Register(0);
             __ I64x4Mul(i.OutputSimd256Register(), i.InputSimd256Register(0),
-                        i.InputSimd256Register(1), i.TempSimd256Register(0),
-                        kScratchSimd256Reg);
+                        i.InputSimd256Register(1), temp, kScratchSimd256Reg);
             break;
           }
           default:
@@ -6866,9 +6911,14 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       break;
     }
     case kX64I8x16Popcnt: {
-      __ I8x16Popcnt(i.OutputSimd128Register(), i.InputSimd128Register(0),
-                     i.TempSimd128Register(0), kScratchDoubleReg,
-                     kScratchRegister);
+      if (UseAvx10_1()) {
+        __ I8x16Popcnt(i.OutputSimd128Register(), i.InputSimd128Register(0),
+                       kScratchRegister);
+      } else {
+        __ I8x16Popcnt(i.OutputSimd128Register(), i.InputSimd128Register(0),
+                       kScratchRegister, i.TempSimd128Register(0),
+                       kScratchDoubleReg);
+      }
       break;
     }
     case kX64S128Load8Splat: {
@@ -8320,10 +8370,20 @@ void CodeGenerator::FinishFrame(Frame* frame) {
   if (!saves.is_empty()) {  // Save callee-saved registers.
     frame->AllocateSavedCalleeRegisterSlots(saves.Count());
   }
+  if (v8_flags.enforce_x64_16byte_alignment) {
+    frame->AlignFrame(2 * kSystemPointerSize);
+  }
 }
 
 void CodeGenerator::AssembleConstructFrame() {
   auto call_descriptor = linkage()->GetIncomingDescriptor();
+
+  if (v8_flags.enforce_x64_16byte_alignment) {
+    // The frame has been previously padded in CodeGenerator::FinishFrame().
+    DCHECK_EQ(frame()->GetTotalFrameSlotCount() % 2, 0);
+    DCHECK_EQ(frame()->GetReturnSlotCount() % 2, 0);
+  }
+
   if (frame_access_state()->has_frame()) {
     int pc_base = __ pc_offset();
 
@@ -8437,8 +8497,7 @@ void CodeGenerator::AssembleConstructFrame() {
         // allocating the stack overflow exception object, but the call did not
         // return in this case.
         // So either way, we can just record an empty safepoint here.
-        ReferenceMap* reference_map = zone()->New<ReferenceMap>(zone());
-        RecordSafepoint(reference_map);
+        RecordSafepointWithoutTaggedSlots();
         __ PopAll(fp_regs_to_save);
         __ PopAll(regs_to_save);
       } else {
@@ -8446,8 +8505,7 @@ void CodeGenerator::AssembleConstructFrame() {
                      RelocInfo::WASM_STUB_CALL);
         // The call does not return, hence we can ignore any references and just
         // define an empty safepoint.
-        ReferenceMap* reference_map = zone()->New<ReferenceMap>(zone());
-        RecordSafepoint(reference_map);
+        RecordSafepointWithoutTaggedSlots();
         __ AssertUnreachable(AbortReason::kUnexpectedReturnFromWasmTrap);
       }
       __ bind(&done);

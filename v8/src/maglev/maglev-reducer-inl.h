@@ -71,13 +71,13 @@ template <typename BaseT>
 MaglevReducer<BaseT>::LazyDeoptFrameScope::LazyDeoptFrameScope(
     MaglevReducer* reducer, ValueNode* context, Builtin continuation,
     compiler::OptionalJSFunctionRef maybe_js_target,
-    base::Vector<ValueNode* const> parameters, bool is_with_catch)
+    base::Vector<ValueNode* const> parameters)
     : reducer_(reducer),
       data_(DeoptFrame::BuiltinContinuationFrameData{
           continuation,
           parameters.empty() ? base::Vector<ValueNode*>{}
                              : reducer->zone()->CloneVector(parameters),
-          context, maybe_js_target, is_with_catch}),
+          context, maybe_js_target}),
       parent_(reducer->current_lazy_deopt_scope_) {
   if constexpr (ReducerBaseWithDeoptFrameScopeHooks<BaseT>) {
     reducer->base_->OnBeginDeoptFrameScope();
@@ -91,10 +91,8 @@ MaglevReducer<BaseT>::LazyDeoptFrameScope::LazyDeoptFrameScope(
       receiver->ForceEscaping();
     }
   }
-  DebugVerifyBuiltinDeoptFrame(
-      data_, is_with_catch
-                 ? compiler::ContinuationFrameStateMode::LAZY_WITH_CATCH
-                 : compiler::ContinuationFrameStateMode::LAZY);
+  DebugVerifyBuiltinDeoptFrame(data_,
+                               compiler::ContinuationFrameStateMode::LAZY);
   reducer->current_lazy_deopt_scope_ = this;
 }
 
@@ -718,6 +716,11 @@ MaybeAssignedFlag MaglevReducer<BaseT>::GetContextMaybeAssigned(
   }
   int header_length = scope_info.ContextHeaderLength();
   if (index < header_length) {
+    DCHECK_EQ(index, Context::EXTENSION_INDEX);
+    if (scope_info.SloppyEvalCanExtendVars()) {
+      *mode = VariableMode::kVar;
+      return kMaybeAssigned;
+    }
     *mode = VariableMode::kConst;
     return kNotAssigned;
   }
@@ -958,7 +961,6 @@ ReduceResult MaglevReducer<BaseT>::BuildInlinedAllocation(
   }
   InlinedAllocation* allocation =
       ExtendOrReallocateCurrentAllocationBlock(allocation_type, vobject);
-  AddNonEscapingUses(allocation, static_cast<int>(values.size()));
   StoreTaggedMode store_mode = StoreTaggedMode::kInitializing;
   compiler::OptionalScopeInfoRef scope_info;
   if (vobject->has_static_map() && vobject->map()->IsContextMap()) {
@@ -982,6 +984,7 @@ ReduceResult MaglevReducer<BaseT>::BuildInlinedAllocation(
     }
     RETURN_IF_ABORT(BuildInitializeStore(desc, allocation, allocation_type,
                                          value, store_mode, maybe_assigned));
+    AddNonEscapingUses(allocation, 1);
   }
   if constexpr (ReducerBaseWithLoopEffectTracking<BaseT>) {
     if (base_->loop_effects()) {
@@ -2680,18 +2683,20 @@ MaybeReduceResult MaglevReducer<BaseT>::TryBuildFastHasInPrototypeChain(
 template <typename BaseT>
 MaybeReduceResult MaglevReducer<BaseT>::TryBuildFastOrdinaryHasInstance(
     ValueNode* context, ValueNode* object, compiler::JSObjectRef callable,
-    ValueNode* callable_node_if_not_constant) {
+    ValueNode* callable_node_if_not_constant, int max_depth) {
   const bool is_constant = callable_node_if_not_constant == nullptr;
   if (!is_constant) return {};
 
   if (callable.IsJSBoundFunction()) {
+    if (max_depth == 0) return {};
     compiler::JSBoundFunctionRef function = callable.AsJSBoundFunction();
     compiler::JSReceiverRef bound_target_function =
         function.bound_target_function(broker());
 
     if (bound_target_function.IsJSObject()) {
-      RETURN_IF_DONE(TryBuildFastInstanceOf(
-          context, object, bound_target_function.AsJSObject(), nullptr));
+      RETURN_IF_DONE(TryBuildFastInstanceOf(context, object,
+                                            bound_target_function.AsJSObject(),
+                                            nullptr, max_depth - 1));
     }
 
     return BuildCallBuiltinWithTaggedInputs<Builtin::kInstanceOf>(
@@ -2718,9 +2723,9 @@ MaybeReduceResult MaglevReducer<BaseT>::TryBuildFastOrdinaryHasInstance(
 template <typename BaseT>
 ReduceResult MaglevReducer<BaseT>::BuildOrdinaryHasInstance(
     ValueNode* context, ValueNode* object, compiler::JSObjectRef callable,
-    ValueNode* callable_node_if_not_constant) {
+    ValueNode* callable_node_if_not_constant, int max_depth) {
   RETURN_IF_DONE(TryBuildFastOrdinaryHasInstance(
-      context, object, callable, callable_node_if_not_constant));
+      context, object, callable, callable_node_if_not_constant, max_depth));
 
   return BuildCallBuiltinWithTaggedInputs<Builtin::kOrdinaryHasInstance>(
       context, {callable_node_if_not_constant ? callable_node_if_not_constant
@@ -2740,7 +2745,7 @@ ReduceResult MaglevReducer<BaseT>::BuildToBoolean(ValueNode* value) {
 template <typename BaseT>
 MaybeReduceResult MaglevReducer<BaseT>::TryBuildFastInstanceOf(
     ValueNode* context, ValueNode* object, compiler::JSObjectRef callable,
-    ValueNode* callable_node_if_not_constant) {
+    ValueNode* callable_node_if_not_constant, int max_depth) {
   compiler::MapRef receiver_map = callable.map(broker());
   compiler::NameRef name = broker()->has_instance_symbol();
   compiler::PropertyAccessInfo access_info = broker()->GetPropertyAccessInfo(
@@ -2758,6 +2763,7 @@ MaybeReduceResult MaglevReducer<BaseT>::TryBuildFastInstanceOf(
         access_info.lookup_start_object_maps(), kStartAtPrototype);
 
     if (callable_node_if_not_constant) {
+      if (!CanEagerDeopt()) return {};
       RETURN_IF_ABORT(BuildCheckMaps(
           callable_node_if_not_constant,
           base::VectorOf(access_info.lookup_start_object_maps())));
@@ -2765,6 +2771,7 @@ MaybeReduceResult MaglevReducer<BaseT>::TryBuildFastInstanceOf(
       if (receiver_map.is_stable()) {
         broker()->dependencies()->DependOnStableMap(receiver_map);
       } else {
+        if (!CanEagerDeopt()) return {};
         RETURN_IF_ABORT(BuildCheckMaps(
             GetConstant(callable),
             base::VectorOf(access_info.lookup_start_object_maps())));
@@ -2772,7 +2779,7 @@ MaybeReduceResult MaglevReducer<BaseT>::TryBuildFastInstanceOf(
     }
 
     return BuildOrdinaryHasInstance(context, object, callable,
-                                    callable_node_if_not_constant);
+                                    callable_node_if_not_constant, max_depth);
   }
 
   if constexpr (!ReducerBaseCanBuildCall<BaseT>) {
@@ -2813,6 +2820,11 @@ MaybeReduceResult MaglevReducer<BaseT>::TryBuildFastInstanceOf(
       callable_node = GetConstant(callable);
     }
 
+    // If we reach this point, then we've passed the
+    // ReducerBaseCanBuildCall<BaseT> check, which only holds for the
+    // GraphBuilder, for which CanEagerDeopt is true, which means that we can
+    // emit a CheckMaps.
+    DCHECK(CanEagerDeopt());
     RETURN_IF_ABORT(BuildCheckMaps(
         callable_node, base::VectorOf(access_info.lookup_start_object_maps())));
 
@@ -2825,7 +2837,8 @@ MaybeReduceResult MaglevReducer<BaseT>::TryBuildFastInstanceOf(
         // {callable}, so we can treat the callable as a compile-time constant
         // from here on, which lets BuildOrdinaryHasInstance take its fast
         // path instead of calling the OrdinaryHasInstance builtin.
-        return BuildOrdinaryHasInstance(context, object, callable, nullptr);
+        return BuildOrdinaryHasInstance(context, object, callable, nullptr,
+                                        max_depth);
       }
     }
 
@@ -3379,19 +3392,15 @@ CallBuiltin* MaglevReducer<BaseT>::BuildCallBuiltin(
 // LINT.IfChange(WasmWrapperInliningConditions)
 template <typename BaseT>
 bool MaglevReducer<BaseT>::ShouldWrapArgsForWasmInlining(
-    compiler::SharedFunctionInfoRef shared, JSDispatchHandle dispatch_handle) {
+    JSDispatchHandle dispatch_handle) {
   if (!is_turbolev()) return false;
   if (!v8_flags.wasm_in_js_inlining_wrapper) return false;
-  // The SharedFunctionInfo of a Wasm exported function does not carry a
-  // builtin ID, so the check below filters out regular JS builtins.
-  // However, the Code installed in the dispatch table can be either:
+  // The Code installed in the dispatch table for a Wasm exported function can
+  // be either:
   //  - The generic kJSToWasmWrapper builtin (used before a per-signature
   //    wrapper has been compiled), or
   //  - A jitted per-signature wrapper (CodeKind::JS_TO_WASM_FUNCTION).
-  // We detect both cases by inspecting the Code object directly.
-  if (!shared.object()->HasWasmExportedFunctionData(local_isolate())) {
-    return false;
-  }
+  // We detect both cases by inspecting the Code object via the dispatch table.
   Tagged<Code> code =
       local_isolate()->js_dispatch_table().GetCode(dispatch_handle);
   return code->builtin_id() == Builtin::kJSToWasmWrapper ||
@@ -3409,7 +3418,7 @@ ReduceResult MaglevReducer<BaseT>::BuildCallKnownJSFunction(
     compiler::FeedbackSource const& feedback_source) {
 #if V8_ENABLE_WEBASSEMBLY
   const bool wrap_args_for_wasm =
-      ShouldWrapArgsForWasmInlining(shared, dispatch_handle);
+      ShouldWrapArgsForWasmInlining(dispatch_handle);
 #endif  // V8_ENABLE_WEBASSEMBLY
 
   size_t input_count = arg_count + CallKnownJSFunction::kFixedInputCount;
@@ -3680,6 +3689,13 @@ MaybeReduceResult MaglevReducer<BaseT>::TryFoldInt32BinaryOperation(
       return GetInt32Constant(result);
     case Operation::kMultiply:
       if (base::bits::SignedMulOverflow32(cst_left, cst_right, &result)) {
+        return {};
+      }
+      // The product is -0 if it is zero and either operand is negative (the
+      // other is then +0). -0 is not representable as an Int32 constant, so
+      // bail out and let Int32MultiplyWithOverflow handle it, as the -x fold
+      // above does.
+      if (result == 0 && (cst_left < 0 || cst_right < 0)) {
         return {};
       }
       return GetInt32Constant(result);
@@ -4195,11 +4211,11 @@ MaybeReduceResult MaglevReducer<BaseT>::TryFoldTestTypeOf(
 }
 
 template <typename BaseT>
-bool MaglevReducer<BaseT>::IsTheHoleConstant(ValueNode* node) {
+bool MaglevReducer<BaseT>::IsTdzHoleConstant(ValueNode* node) {
   if (node != nullptr) {
     if (compiler::OptionalHeapObjectRef maybe_constant =
             TryGetConstant<HeapObject>(node)) {
-      return maybe_constant->IsTheHole();
+      return maybe_constant->IsTdzHole();
     }
   }
   return false;
@@ -4209,7 +4225,7 @@ template <typename BaseT>
 ReduceResult MaglevReducer<BaseT>::GetConvertReceiver(
     compiler::SharedFunctionInfoRef shared, ValueNode* receiver,
     ConvertReceiverMode mode) {
-  DCHECK(!IsTheHoleConstant(receiver));
+  DCHECK(!IsTdzHoleConstant(receiver));
   if (shared.native() || shared.language_mode() == LanguageMode::kStrict) {
     if (mode == ConvertReceiverMode::kNullOrUndefined) {
       return GetRootConstant(RootIndex::kUndefinedValue);
@@ -4840,6 +4856,23 @@ MaybeReduceResult MaglevReducer<BaseT>::TryReduceMathFround(
 }
 
 template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::BuildSpeculativeCheckInstanceType(
+    ValueNode* object, NodeType target_type, InstanceType first,
+    InstanceType last) {
+  NodeType known_type;
+  EnsureTypeResult ensure_res = known_node_aspects().TryEnsureType(
+      broker(), object, target_type, &known_type);
+  if (ensure_res == EnsureTypeResult::kAlreadyHadType) {
+    return ReduceResult::Done();
+  }
+  if (ensure_res == EnsureTypeResult::kContradiction) {
+    return {};
+  }
+  return AddNewNode<CheckInstanceType>({object}, GetCheckType(known_type),
+                                       first, last);
+}
+
+template <typename BaseT>
 ReduceResult MaglevReducer<BaseT>::BuildCheckInstanceType(ValueNode* object,
                                                           NodeType target_type,
                                                           InstanceType first,
@@ -5143,15 +5176,16 @@ template <typename LoadNode>
 MaybeReduceResult MaglevReducer<BaseT>::TryBuildLoadDataView(
     const CallArguments& args, ExternalArrayType type) {
   if (!CanSpeculateCall()) return {};
-  if (!broker()->dependencies()->DependOnArrayBufferDetachingProtector()) {
-    // TODO(victorgomes): Add checks whether the array has been detached or is
-    // immutable.
-    return {};
-  }
   ValueNode* receiver = GetValueOrUndefined(args.receiver());
-  RETURN_IF_ABORT(BuildCheckInstanceType(receiver, NodeType::kJSDataView,
-                                         JS_DATA_VIEW_TYPE, JS_DATA_VIEW_TYPE));
-  // TODO(v8:11111): Optimize for JS_RAB_GSAB_DATA_VIEW_TYPE too.
+  RETURN_IF_NOT_DONE_WITHOUT_ABORT(BuildSpeculativeCheckInstanceType(
+      receiver, NodeType::kJSDataView, JS_DATA_VIEW_TYPE, JS_DATA_VIEW_TYPE));
+  bool depend_on_detaching =
+      broker()->dependencies()->DependOnArrayBufferDetachingProtector();
+  if (!depend_on_detaching) {
+    RETURN_IF_ABORT(AddNewNode<CheckTypedArrayValid>(
+        {receiver}, TypedArrayAccessMode::kRead));
+  }
+  // TODO(555676855): Optimize for JS_RAB_GSAB_DATA_VIEW_TYPE too.
   ValueNode* offset;
   if (args[0]) {
     GET_VALUE_OR_ABORT(offset, GetInt32ElementIndex(args[0]));
@@ -5178,15 +5212,18 @@ template <typename StoreNode, typename Function>
 MaybeReduceResult MaglevReducer<BaseT>::TryBuildStoreDataView(
     const CallArguments& args, ExternalArrayType type, Function&& getValue) {
   if (!CanSpeculateCall()) return {};
-  if (!broker()->dependencies()->DependOnArrayBufferDetachingProtector() ||
-      !broker()->dependencies()->DependOnArrayBufferMutableProtector()) {
-    // TODO(victorgomes): Add checks whether the array has been detached.
-    return {};
-  }
   ValueNode* receiver = GetValueOrUndefined(args.receiver());
-  RETURN_IF_ABORT(BuildCheckInstanceType(receiver, NodeType::kJSDataView,
-                                         JS_DATA_VIEW_TYPE, JS_DATA_VIEW_TYPE));
-  // TODO(v8:11111): Optimize for JS_RAB_GSAB_DATA_VIEW_TYPE too.
+  RETURN_IF_NOT_DONE_WITHOUT_ABORT(BuildSpeculativeCheckInstanceType(
+      receiver, NodeType::kJSDataView, JS_DATA_VIEW_TYPE, JS_DATA_VIEW_TYPE));
+  bool depend_on_detaching =
+      broker()->dependencies()->DependOnArrayBufferDetachingProtector();
+  bool depend_on_mutable =
+      broker()->dependencies()->DependOnArrayBufferMutableProtector();
+  if (!depend_on_detaching || !depend_on_mutable) {
+    RETURN_IF_ABORT(AddNewNode<CheckTypedArrayValid>(
+        {receiver}, TypedArrayAccessMode::kWrite));
+  }
+  // TODO(555676855): Optimize for JS_RAB_GSAB_DATA_VIEW_TYPE too.
   ValueNode* offset;
   if (args[0]) {
     GET_VALUE_OR_ABORT(offset, GetInt32ElementIndex(args[0]));
@@ -5213,41 +5250,120 @@ MaybeReduceResult MaglevReducer<BaseT>::TryBuildStoreDataView(
 template <typename BaseT>
 MaybeReduceResult MaglevReducer<BaseT>::TryReduceDataViewPrototypeGetInt8(
     ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
-  return TryBuildLoadDataView<LoadSignedIntDataViewElement>(
+  return TryBuildLoadDataView<LoadInt32DataViewElement>(
       args, ExternalArrayType::kExternalInt8Array);
 }
 template <typename BaseT>
 MaybeReduceResult MaglevReducer<BaseT>::TryReduceDataViewPrototypeSetInt8(
     ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
-  return TryBuildStoreDataView<StoreSignedIntDataViewElement>(
-      args, ExternalArrayType::kExternalInt8Array,
-      [&](ValueNode* value) { return value ? value : GetInt32Constant(0); });
+  return TryBuildStoreDataView<StoreInt32DataViewElement>(
+      args, ExternalArrayType::kExternalInt8Array, [&](ValueNode* value) {
+        return value ? GetTruncatedInt32ForToNumber(value,
+                                                    NodeType::kNumberOrOddball)
+                     : GetInt32Constant(0);
+      });
+}
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceDataViewPrototypeGetUint8(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  return TryBuildLoadDataView<LoadInt32DataViewElement>(
+      args, ExternalArrayType::kExternalUint8Array);
+}
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceDataViewPrototypeSetUint8(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  return TryBuildStoreDataView<StoreInt32DataViewElement>(
+      args, ExternalArrayType::kExternalUint8Array, [&](ValueNode* value) {
+        return value ? GetTruncatedInt32ForToNumber(value,
+                                                    NodeType::kNumberOrOddball)
+                     : GetInt32Constant(0);
+      });
 }
 template <typename BaseT>
 MaybeReduceResult MaglevReducer<BaseT>::TryReduceDataViewPrototypeGetInt16(
     ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
-  return TryBuildLoadDataView<LoadSignedIntDataViewElement>(
+  return TryBuildLoadDataView<LoadInt32DataViewElement>(
       args, ExternalArrayType::kExternalInt16Array);
 }
 template <typename BaseT>
 MaybeReduceResult MaglevReducer<BaseT>::TryReduceDataViewPrototypeSetInt16(
     ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
-  return TryBuildStoreDataView<StoreSignedIntDataViewElement>(
-      args, ExternalArrayType::kExternalInt16Array,
-      [&](ValueNode* value) { return value ? value : GetInt32Constant(0); });
+  return TryBuildStoreDataView<StoreInt32DataViewElement>(
+      args, ExternalArrayType::kExternalInt16Array, [&](ValueNode* value) {
+        return value ? GetTruncatedInt32ForToNumber(value,
+                                                    NodeType::kNumberOrOddball)
+                     : GetInt32Constant(0);
+      });
+}
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceDataViewPrototypeGetUint16(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  return TryBuildLoadDataView<LoadInt32DataViewElement>(
+      args, ExternalArrayType::kExternalUint16Array);
+}
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceDataViewPrototypeSetUint16(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  return TryBuildStoreDataView<StoreInt32DataViewElement>(
+      args, ExternalArrayType::kExternalUint16Array, [&](ValueNode* value) {
+        return value ? GetTruncatedInt32ForToNumber(value,
+                                                    NodeType::kNumberOrOddball)
+                     : GetInt32Constant(0);
+      });
 }
 template <typename BaseT>
 MaybeReduceResult MaglevReducer<BaseT>::TryReduceDataViewPrototypeGetInt32(
     ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
-  return TryBuildLoadDataView<LoadSignedIntDataViewElement>(
+  return TryBuildLoadDataView<LoadInt32DataViewElement>(
       args, ExternalArrayType::kExternalInt32Array);
 }
 template <typename BaseT>
 MaybeReduceResult MaglevReducer<BaseT>::TryReduceDataViewPrototypeSetInt32(
     ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
-  return TryBuildStoreDataView<StoreSignedIntDataViewElement>(
-      args, ExternalArrayType::kExternalInt32Array,
-      [&](ValueNode* value) { return value ? value : GetInt32Constant(0); });
+  return TryBuildStoreDataView<StoreInt32DataViewElement>(
+      args, ExternalArrayType::kExternalInt32Array, [&](ValueNode* value) {
+        return value ? GetTruncatedInt32ForToNumber(value,
+                                                    NodeType::kNumberOrOddball)
+                     : GetInt32Constant(0);
+      });
+}
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceDataViewPrototypeGetUint32(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  return TryBuildLoadDataView<LoadUint32DataViewElement>(
+      args, ExternalArrayType::kExternalUint32Array);
+}
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceDataViewPrototypeSetUint32(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  return TryBuildStoreDataView<StoreInt32DataViewElement>(
+      args, ExternalArrayType::kExternalUint32Array, [&](ValueNode* value) {
+        return value ? GetTruncatedInt32ForToNumber(value,
+                                                    NodeType::kNumberOrOddball)
+                     : GetInt32Constant(0);
+      });
+}
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceDataViewPrototypeGetFloat32(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  return TryBuildLoadDataView<LoadDoubleDataViewElement>(
+      args, ExternalArrayType::kExternalFloat32Array);
+}
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceDataViewPrototypeSetFloat32(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  return TryBuildStoreDataView<StoreDoubleDataViewElement>(
+      args, ExternalArrayType::kExternalFloat32Array, [&](ValueNode* value) {
+#ifdef V8_ENABLE_UNDEFINED_DOUBLE
+        // Produce the same bit pattern we would get through computation.
+        auto ud = Float64::FromBits(kUndefinedNanInt64);
+        const double silenced_nan = ud.to_quiet_nan().get_scalar();
+#else
+        const double silenced_nan = std::numeric_limits<double>::quiet_NaN();
+#endif  // V8_ENABLE_UNDEFINED_DOUBLE
+        return value ? GetFloat64ForToNumber(value, NodeType::kNumberOrOddball)
+                     : GetFloat64Constant(silenced_nan);
+      });
 }
 template <typename BaseT>
 MaybeReduceResult MaglevReducer<BaseT>::TryReduceDataViewPrototypeGetFloat64(
@@ -6443,7 +6559,7 @@ MaybeReduceResult MaglevReducer<BaseT>::TryReduceTypedArrayConstructor(
   LazyDeoptFrameScope continuation(
       this, context, Builtin::kGenericLazyDeoptContinuation, target,
       base::VectorOf<ValueNode* const>(
-          {GetRootConstant(RootIndex::kTheHoleValue)}));
+          {GetRootConstant(RootIndex::kTdzHoleValue)}));
   return BuildCallBuiltinWithTaggedInputs<Builtin::kCreateTypedArray>(
       GetConstant(broker()->target_native_context()),
       {target_node, new_target, arg0, arg1, arg2});

@@ -50,6 +50,8 @@ DirectHandle<Managed<CppType>> Managed<CppType>::From(
           reinterpret_cast<Address>(destructor), allocation_type));
   IndirectHandle<Object> global_handle =
       isolate->global_handles()->Create(*handle);
+  SharedObjectConditionalSafePublishGuard publish_guard(*handle,
+                                                        allocation_type);
   destructor->global_handle_location_ = global_handle.location();
   GlobalHandles::MakeWeak(destructor->global_handle_location_, destructor,
                           &ManagedObjectFinalizer,
@@ -83,9 +85,9 @@ DirectHandle<TrustedManaged<CppType>> TrustedManaged<CppType>::From(
 }
 
 inline CppGCManagedWrapper* CppGCManagedBase::GetWrapper() const {
-  return reinterpret_cast<CppGCManagedWrapper*>(ReadCppHeapPointerField(
-      offsetof(CppGCManagedBase, cpp_gc_wrapper_), Isolate::Current(),
-      CppHeapPointerTag::kCppGCManagedTag));
+  return reinterpret_cast<CppGCManagedWrapper*>(
+      ReadCppHeapPointerField(offsetof(CppGCManagedBase, cpp_gc_wrapper_),
+                              Isolate::Current(), kCppGCManagedTag));
 }
 
 inline size_t CppGCManagedBase::estimated_size() const {
@@ -109,8 +111,7 @@ Handle<CppGCManaged<CppType>> CppGCManaged<CppType>::Create(
       *isolate->factory()->NewCppGCManagedBase(allocation_type);
   raw->WriteLazilyInitializedCppHeapPointerField(
       offsetof(CppGCManagedBase, cpp_gc_wrapper_), isolate,
-      reinterpret_cast<Address>(destructor),
-      CppHeapPointerTag::kCppGCManagedTag);
+      reinterpret_cast<Address>(destructor), kCppGCManagedTag);
   WriteBarrier::ForCppHeapPointer(
       raw,
       raw->RawCppHeapPointerField(offsetof(CppGCManagedBase, cpp_gc_wrapper_)),

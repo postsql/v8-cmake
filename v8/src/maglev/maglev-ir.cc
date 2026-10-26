@@ -7,6 +7,7 @@
 #include <cmath>
 #include <limits>
 #include <optional>
+#include <type_traits>
 
 #include "src/api/api.h"
 #include "src/base/bounds.h"
@@ -25,6 +26,7 @@
 #include "src/compiler/js-heap-broker.h"
 #include "src/deoptimizer/deoptimize-reason.h"
 #include "src/execution/isolate-inl.h"
+#include "src/heap/heap-layout-inl.h"
 #include "src/heap/local-heap.h"
 #include "src/heap/parked-scope.h"
 #include "src/interpreter/bytecode-flags-and-tokens.h"
@@ -835,10 +837,10 @@ Range ValueNode::GetStaticRange() const {
   }
 }
 
-Tribool ValueNode::IsTheHole() const {
-  if (!CanBeTheHoleValue(opcode())) return Tribool::kFalse;
+Tribool ValueNode::IsHole(RootIndex hole_index) const {
+  if (!CanBeHoleValue(hole_index, opcode())) return Tribool::kFalse;
   if (const RootConstant* cst = TryCast<RootConstant>()) {
-    return ToTribool(cst->index() == RootIndex::kTheHoleValue);
+    return ToTribool(cst->index() == hole_index);
   }
   if (const LoadTaggedField* load = TryCast<LoadTaggedField>()) {
     // There are a few ways that this can load a hole, for instance through a
@@ -853,19 +855,20 @@ Tribool ValueNode::IsTheHole() const {
     return Tribool::kMaybe;
   }
   if (const LoadFixedArrayElement* load = TryCast<LoadFixedArrayElement>()) {
+    DCHECK_EQ(hole_index, RootIndex::kTheHoleValue);
     if (load->load_type() != LoadType::kUnknown) {
       return Tribool::kFalse;
     }
     return Tribool::kMaybe;
   }
   if (Is<Identity>()) {
-    return UnwrapIdentities()->IsTheHole();
+    return UnwrapIdentities()->IsHole(hole_index);
   }
   if (const Phi* phi = TryCast<Phi>()) {
     if (!phi->is_loop_phi() && !phi->is_exception_phi()) {
       bool can_be_the_hole = false;
       for (ConstInput input : phi->inputs()) {
-        if (input.node()->IsTheHole() != Tribool::kFalse) {
+        if (input.node()->IsHole(hole_index) != Tribool::kFalse) {
           can_be_the_hole = true;
           break;
         }
@@ -1040,13 +1043,16 @@ void CallBuiltin::MarkTaggedInputsAsDecompressing() {
 
 void StoreTaggedFieldNoWriteBarrier::VerifyInputs() const {
   Base::VerifyInputs();
-  auto host_alloc = input(kObjectIndex).node()->TryCast<InlinedAllocation>();
-  auto value_alloc = input(kValueIndex).node()->TryCast<InlinedAllocation>();
-  if (host_alloc && value_alloc &&
-      host_alloc->allocation_block() == value_alloc->allocation_block()) {
-    CHECK_EQ(host_alloc->allocation_block()->allocation_type(),
-             AllocationType::kYoung);
-  }
+  // Here we'd like to verify that the write barrier can legitimately be
+  // skipped. However, we cannot, since this might be in dead code and our
+  // information might be inconsistent. This is because: 1) in Turbolev, we
+  // occasionally run the verifier before running GraphOptimizer which would
+  // delete dead branches and 2) we generally cannot detect upfront when we're
+  // in dead code.
+
+  // TODO(562805652): Could run the check for pure maglev (non-turbolev)
+  // compilations without eager inlining, if we were able to have that info
+  // here.
 }
 
 void InlinedAllocation::VerifyInputs() const {
@@ -1110,6 +1116,22 @@ void AllocationBlock::TryPretenure(ValueNode* value) {
       }
     }
   }
+}
+
+StoreMap::StoreMap(uint64_t bitfield, compiler::MapRef map, Kind kind)
+    : Base(bitfield | KindField::encode(kind) |
+           MapInReadOnlySpaceField::encode(
+               HeapLayout::InReadOnlySpace(*map.object()))),
+      map_(map) {}
+
+bool StoreMap::NoWriteBarrier() const {
+  if (MapInReadOnlySpaceField::decode(bitfield())) return true;
+  return kind() == Kind::kInlinedAllocation &&
+         ValueInput()
+                 .node()
+                 ->Cast<InlinedAllocation>()
+                 ->allocation_block()
+                 ->allocation_type() == AllocationType::kYoung;
 }
 
 // ---
@@ -1272,11 +1294,19 @@ void HoleyFloat64Constant::DoLoadToRegister(MaglevAssembler* masm,
 }
 
 void HeapConstant::DoLoadToRegister(MaglevAssembler* masm, Register reg) const {
-  __ Move(reg, object_.object());
+  if (decompresses_tagged_result()) {
+    __ Move(reg, object_.object());
+  } else {
+    __ MoveTagged(reg, object_.object());
+  }
 }
 
 void RootConstant::DoLoadToRegister(MaglevAssembler* masm, Register reg) const {
-  __ LoadRoot(reg, index());
+  if (decompresses_tagged_result()) {
+    __ LoadRoot(reg, index());
+  } else {
+    __ LoadTaggedRoot(reg, index());
+  }
 }
 
 void TrustedConstant::DoLoadToRegister(MaglevAssembler* masm,
@@ -2643,6 +2673,12 @@ void CheckHomomorphicMap::GenerateCode(MaglevAssembler* masm,
   int descriptor_index =
       LoadHandler::DescriptorIndexBits::decode(handler_value_);
 
+  // Reject special receivers. Access checks and named interceptors imply
+  // special receiver.
+  __ CompareInstanceTypeAndJumpIf(
+      map, LAST_SPECIAL_RECEIVER_TYPE, kUnsignedLessThanEqual,
+      __ GetDeoptLabel(this, DeoptimizeReason::kWrongMap), Label::kFar);
+
   // 1. Check descriptor count.
   Register descriptor_count = scratch;
   __ LoadInt32(descriptor_count,
@@ -3728,43 +3764,45 @@ void StoreFixedDoubleArrayHole::GenerateCode(MaglevAssembler* masm,
 }
 
 int StoreMap::MaxCallStackArgs() const {
-  return WriteBarrierDescriptor::GetStackParameterCount();
+  return NoWriteBarrier() ? 0
+                          : WriteBarrierDescriptor::GetStackParameterCount();
 }
 void StoreMap::SetValueLocationConstraints() {
-  UseFixed(ValueInput(), WriteBarrierDescriptor::ObjectRegister());
-  set_temporaries_needed(1);
+  if (NoWriteBarrier()) {
+    UseRegister(ValueInput());
+    if (!MaglevAssembler::kSupportsStoreTaggedConstant) {
+      set_temporaries_needed(1);
+    }
+  } else {
+    UseFixed(ValueInput(), WriteBarrierDescriptor::ObjectRegister());
+    set_temporaries_needed(1);
+  }
 }
 void StoreMap::GenerateCode(MaglevAssembler* masm,
                             const ProcessingState& state) {
   MaglevAssembler::TemporaryRegisterScope temps(masm);
-  // TODO(leszeks): Consider making this an arbitrary register and push/popping
-  // in the deferred path.
-  Register object = WriteBarrierDescriptor::ObjectRegister();
-  DCHECK_EQ(object, ToRegister(ValueInput()));
+  Register object = ToRegister(ValueInput());
+  if (NoWriteBarrier()) {
+    if (MaglevAssembler::kSupportsStoreTaggedConstant) {
+      __ StoreTaggedFieldNoWriteBarrier(object, offsetof(HeapObject, map_),
+                                        map_.object());
+      __ AssertElidedWriteBarrier(object, map_, register_snapshot());
+    } else {
+      Register value = temps.Acquire();
+      __ MoveTagged(value, map_.object());
+      __ StoreTaggedFieldNoWriteBarrier(object, offsetof(HeapObject, map_),
+                                        value);
+      __ AssertElidedWriteBarrier(object, value, register_snapshot());
+    }
+    return;
+  }
+
+  DCHECK_EQ(object, WriteBarrierDescriptor::ObjectRegister());
   Register value = temps.Acquire();
   __ MoveTagged(value, map_.object());
-
-  switch (kind()) {
-    case Kind::kInlinedAllocation: {
-      DCHECK(ValueInput().node()->Cast<InlinedAllocation>());
-      auto inlined = ValueInput().node()->Cast<InlinedAllocation>();
-      if (inlined->allocation_block()->allocation_type() ==
-          AllocationType::kYoung) {
-        __ StoreTaggedFieldNoWriteBarrier(object, offsetof(HeapObject, map_),
-                                          value);
-        __ AssertElidedWriteBarrier(object, value, register_snapshot());
-        break;
-      }
-      [[fallthrough]];
-    }
-    case Kind::kInitializing:
-    case Kind::kTransitioning:
-      __ StoreTaggedFieldWithWriteBarrier(object, offsetof(HeapObject, map_),
-                                          value, register_snapshot(),
-                                          MaglevAssembler::kValueIsCompressed,
-                                          MaglevAssembler::kValueCannotBeSmi);
-      break;
-  }
+  __ StoreTaggedFieldWithWriteBarrier(
+      object, offsetof(HeapObject, map_), value, register_snapshot(),
+      MaglevAssembler::kValueIsCompressed, MaglevAssembler::kValueCannotBeSmi);
 }
 
 int StoreTaggedFieldWithWriteBarrier::MaxCallStackArgs() const {
@@ -3813,7 +3851,24 @@ void StoreTrustedPointerFieldWithWriteBarrier::GenerateCode(
 #endif
 }
 
-void LoadSignedIntDataViewElement::SetValueLocationConstraints() {
+namespace {
+
+bool IsSigned(ExternalArrayType element_type) {
+  switch (element_type) {
+#define TYPED_ARRAY_CASE(Type, type, TYPE, ctype) \
+  case kExternal##Type##Array:                    \
+    DCHECK(std::is_integral_v<ctype>);            \
+    return std::is_signed_v<ctype>;
+    TYPED_ARRAYS(TYPED_ARRAY_CASE)
+    default:
+      UNREACHABLE();
+#undef TYPED_ARRAY_CASE
+  }
+}
+
+}  // namespace
+
+void LoadInt32DataViewElement::SetValueLocationConstraints() {
   // Note: we're not actually using the object input (the DataView itself) since
   // {data_pointer_input} already contains the pointer to the data, but we're
   // still doing a `UseRegister(object_input())` in order to keep the DataView
@@ -3823,7 +3878,7 @@ void LoadSignedIntDataViewElement::SetValueLocationConstraints() {
   UseRegister(DataPointerInput());
   UseRegister(IndexInput());
   if (IsIsLittleEndianInputConstant() ||
-      type_ == ExternalArrayType::kExternalInt8Array) {
+      compiler::ExternalArrayElementSize(external_array_type()) == 1) {
     UseAny(IsLittleEndianInput());
   } else {
     UseRegister(IsLittleEndianInput());
@@ -3831,33 +3886,42 @@ void LoadSignedIntDataViewElement::SetValueLocationConstraints() {
   DefineAsRegister(this);
   set_temporaries_needed(1);
 }
-void LoadSignedIntDataViewElement::GenerateCode(MaglevAssembler* masm,
-                                                const ProcessingState& state) {
+void LoadInt32DataViewElement::GenerateCode(MaglevAssembler* masm,
+                                            const ProcessingState& state) {
   Register data_pointer = ToRegister(DataPointerInput());
   Register index = ToRegister(IndexInput());
   Register result_reg = ToRegister(result());
 
-  int element_size = compiler::ExternalArrayElementSize(type_);
+  int element_size = compiler::ExternalArrayElementSize(external_array_type());
+  bool is_signed = IsSigned(external_array_type());
 
   // We need to make sure we don't clobber is_little_endian_input by writing to
   // the result register.
   Register reg_with_result = result_reg;
   MaglevAssembler::TemporaryRegisterScope temps(masm);
-  if (type_ != ExternalArrayType::kExternalInt8Array &&
-      !IsIsLittleEndianInputConstant() &&
+  if (element_size > 1 && !IsIsLittleEndianInputConstant() &&
       result_reg == ToRegister(IsLittleEndianInput())) {
     reg_with_result = temps.Acquire();
   }
 
-  __ LoadDataViewElement(reg_with_result, data_pointer, index, element_size);
+  if (is_signed) {
+    __ LoadDataViewElement(reg_with_result, data_pointer, index, element_size);
+  } else {
+    __ LoadUnsignedDataViewElement(reg_with_result, data_pointer, index,
+                                   element_size);
+  }
 
   // We ignore little endian argument if type is a byte size.
-  if (type_ != ExternalArrayType::kExternalInt8Array) {
+  if (element_size > 1) {
     if (IsIsLittleEndianInputConstant()) {
       if (FromConstantToBool(masm, IsLittleEndianInput().node()) ==
           V8_TARGET_BIG_ENDIAN_BOOL) {
         DCHECK_EQ(reg_with_result, result_reg);
-        __ ReverseByteOrder(result_reg, element_size);
+        if (is_signed) {
+          __ ReverseByteOrder(result_reg, element_size);
+        } else {
+          __ ReverseByteOrderUnsigned(result_reg, element_size);
+        }
       }
     } else {
       ZoneLabelRef keep_byte_order(masm), reverse_byte_order(masm);
@@ -3868,7 +3932,11 @@ void LoadSignedIntDataViewElement::GenerateCode(MaglevAssembler* masm,
           V8_TARGET_BIG_ENDIAN_BOOL ? keep_byte_order : reverse_byte_order,
           false);
       __ bind(*reverse_byte_order);
-      __ ReverseByteOrder(reg_with_result, element_size);
+      if (is_signed) {
+        __ ReverseByteOrder(reg_with_result, element_size);
+      } else {
+        __ ReverseByteOrderUnsigned(reg_with_result, element_size);
+      }
       __ bind(*keep_byte_order);
       if (reg_with_result != result_reg) {
         __ Move(result_reg, reg_with_result);
@@ -3877,7 +3945,57 @@ void LoadSignedIntDataViewElement::GenerateCode(MaglevAssembler* masm,
   }
 }
 
-void StoreSignedIntDataViewElement::SetValueLocationConstraints() {
+void LoadUint32DataViewElement::SetValueLocationConstraints() {
+  UseRegister(ObjectInput());
+  UseRegister(DataPointerInput());
+  UseRegister(IndexInput());
+  if (IsIsLittleEndianInputConstant()) {
+    UseAny(IsLittleEndianInput());
+  } else {
+    UseRegister(IsLittleEndianInput());
+  }
+  DefineAsRegister(this);
+  set_temporaries_needed(1);
+}
+void LoadUint32DataViewElement::GenerateCode(MaglevAssembler* masm,
+                                             const ProcessingState& state) {
+  Register data_pointer = ToRegister(DataPointerInput());
+  Register index = ToRegister(IndexInput());
+  Register result_reg = ToRegister(result());
+
+  Register reg_with_result = result_reg;
+  MaglevAssembler::TemporaryRegisterScope temps(masm);
+  if (!IsIsLittleEndianInputConstant() &&
+      result_reg == ToRegister(IsLittleEndianInput())) {
+    reg_with_result = temps.Acquire();
+  }
+
+  __ LoadUnsignedDataViewElement(reg_with_result, data_pointer, index, 4);
+
+  if (IsIsLittleEndianInputConstant()) {
+    if (FromConstantToBool(masm, IsLittleEndianInput().node()) ==
+        V8_TARGET_BIG_ENDIAN_BOOL) {
+      DCHECK_EQ(reg_with_result, result_reg);
+      __ ReverseByteOrderUnsigned(result_reg, 4);
+    }
+  } else {
+    ZoneLabelRef keep_byte_order(masm), reverse_byte_order(masm);
+    DCHECK_NE(reg_with_result, ToRegister(IsLittleEndianInput()));
+    __ ToBoolean(
+        ToRegister(IsLittleEndianInput()), CheckType::kCheckHeapObject,
+        V8_TARGET_BIG_ENDIAN_BOOL ? reverse_byte_order : keep_byte_order,
+        V8_TARGET_BIG_ENDIAN_BOOL ? keep_byte_order : reverse_byte_order,
+        false);
+    __ bind(*reverse_byte_order);
+    __ ReverseByteOrderUnsigned(reg_with_result, 4);
+    __ bind(*keep_byte_order);
+    if (reg_with_result != result_reg) {
+      __ Move(result_reg, reg_with_result);
+    }
+  }
+}
+
+void StoreInt32DataViewElement::SetValueLocationConstraints() {
   // Note: we're not actually using the object input (the DataView itself) since
   // {data_pointer_input} already contains the pointer to the data, but we're
   // still doing a `UseRegister(object_input())` in order to keep the DataView
@@ -3886,25 +4004,25 @@ void StoreSignedIntDataViewElement::SetValueLocationConstraints() {
 
   UseRegister(DataPointerInput());
   UseRegister(IndexInput());
-  if (compiler::ExternalArrayElementSize(type_) > 1) {
+  if (compiler::ExternalArrayElementSize(external_array_type()) > 1) {
     UseAndClobberRegister(ValueInput());
   } else {
     UseRegister(ValueInput());
   }
   if (IsIsLittleEndianInputConstant() ||
-      type_ == ExternalArrayType::kExternalInt8Array) {
+      compiler::ExternalArrayElementSize(external_array_type()) == 1) {
     UseAny(IsLittleEndianInput());
   } else {
     UseRegister(IsLittleEndianInput());
   }
 }
-void StoreSignedIntDataViewElement::GenerateCode(MaglevAssembler* masm,
-                                                 const ProcessingState& state) {
+void StoreInt32DataViewElement::GenerateCode(MaglevAssembler* masm,
+                                             const ProcessingState& state) {
   Register data_pointer = ToRegister(DataPointerInput());
   Register index = ToRegister(IndexInput());
   Register value = ToRegister(ValueInput());
 
-  int element_size = compiler::ExternalArrayElementSize(type_);
+  int element_size = compiler::ExternalArrayElementSize(external_array_type());
 
   // We ignore little endian argument if type is a byte size.
   if (element_size > 1) {
@@ -3951,31 +4069,62 @@ void LoadDoubleDataViewElement::GenerateCode(MaglevAssembler* masm,
   Register index = ToRegister(IndexInput());
   DoubleRegister result_reg = ToDoubleRegister(result());
 
-  if (IsIsLittleEndianInputConstant()) {
-    if (FromConstantToBool(masm, IsLittleEndianInput().node()) !=
-        V8_TARGET_BIG_ENDIAN_BOOL) {
-      __ LoadUnalignedFloat64(result_reg, data_pointer, index);
+  if (external_array_type() == ExternalArrayType::kExternalFloat64Array) {
+    if (IsIsLittleEndianInputConstant()) {
+      if (FromConstantToBool(masm, IsLittleEndianInput().node()) !=
+          V8_TARGET_BIG_ENDIAN_BOOL) {
+        __ LoadUnalignedFloat64(result_reg, data_pointer, index);
+      } else {
+        __ LoadUnalignedFloat64AndReverseByteOrder(result_reg, data_pointer,
+                                                   index);
+      }
     } else {
+      Label done;
+      ZoneLabelRef keep_byte_order(masm), reverse_byte_order(masm);
+      // TODO(leszeks): We're likely to be calling this on an existing boolean
+      // -- maybe that's a case we should fast-path here and reuse that boolean
+      // value?
+      __ ToBoolean(
+          ToRegister(IsLittleEndianInput()), CheckType::kCheckHeapObject,
+          V8_TARGET_BIG_ENDIAN_BOOL ? reverse_byte_order : keep_byte_order,
+          V8_TARGET_BIG_ENDIAN_BOOL ? keep_byte_order : reverse_byte_order,
+          true);
+      __ bind(*keep_byte_order);
+      __ LoadUnalignedFloat64(result_reg, data_pointer, index);
+      __ Jump(&done);
+      // We should swap the bytes if big endian.
+      __ bind(*reverse_byte_order);
       __ LoadUnalignedFloat64AndReverseByteOrder(result_reg, data_pointer,
                                                  index);
+      __ bind(&done);
     }
   } else {
-    Label done;
-    ZoneLabelRef keep_byte_order(masm), reverse_byte_order(masm);
-    // TODO(leszeks): We're likely to be calling this on an existing boolean --
-    // maybe that's a case we should fast-path here and reuse that boolean
-    // value?
-    __ ToBoolean(
-        ToRegister(IsLittleEndianInput()), CheckType::kCheckHeapObject,
-        V8_TARGET_BIG_ENDIAN_BOOL ? reverse_byte_order : keep_byte_order,
-        V8_TARGET_BIG_ENDIAN_BOOL ? keep_byte_order : reverse_byte_order, true);
-    __ bind(*keep_byte_order);
-    __ LoadUnalignedFloat64(result_reg, data_pointer, index);
-    __ Jump(&done);
-    // We should swap the bytes if big endian.
-    __ bind(*reverse_byte_order);
-    __ LoadUnalignedFloat64AndReverseByteOrder(result_reg, data_pointer, index);
-    __ bind(&done);
+    DCHECK_EQ(external_array_type(), ExternalArrayType::kExternalFloat32Array);
+    if (IsIsLittleEndianInputConstant()) {
+      if (FromConstantToBool(masm, IsLittleEndianInput().node()) !=
+          V8_TARGET_BIG_ENDIAN_BOOL) {
+        __ LoadUnalignedFloat32(result_reg, data_pointer, index);
+      } else {
+        __ LoadUnalignedFloat32AndReverseByteOrder(result_reg, data_pointer,
+                                                   index);
+      }
+    } else {
+      Label done;
+      ZoneLabelRef keep_byte_order(masm), reverse_byte_order(masm);
+      __ ToBoolean(
+          ToRegister(IsLittleEndianInput()), CheckType::kCheckHeapObject,
+          V8_TARGET_BIG_ENDIAN_BOOL ? reverse_byte_order : keep_byte_order,
+          V8_TARGET_BIG_ENDIAN_BOOL ? keep_byte_order : reverse_byte_order,
+          true);
+      __ bind(*keep_byte_order);
+      __ LoadUnalignedFloat32(result_reg, data_pointer, index);
+      __ Jump(&done);
+      // We should swap the bytes if big endian.
+      __ bind(*reverse_byte_order);
+      __ LoadUnalignedFloat32AndReverseByteOrder(result_reg, data_pointer,
+                                                 index);
+      __ bind(&done);
+    }
   }
 }
 
@@ -4001,30 +4150,58 @@ void StoreDoubleDataViewElement::GenerateCode(MaglevAssembler* masm,
   Register index = ToRegister(IndexInput());
   DoubleRegister value = ToDoubleRegister(ValueInput());
 
-  if (IsIsLittleEndianInputConstant()) {
-    if (FromConstantToBool(masm, IsLittleEndianInput().node()) !=
-        V8_TARGET_BIG_ENDIAN_BOOL) {
-      __ StoreUnalignedFloat64(data_pointer, index, value);
+  if (external_array_type() == ExternalArrayType::kExternalFloat64Array) {
+    if (IsIsLittleEndianInputConstant()) {
+      if (FromConstantToBool(masm, IsLittleEndianInput().node()) !=
+          V8_TARGET_BIG_ENDIAN_BOOL) {
+        __ StoreUnalignedFloat64(data_pointer, index, value);
+      } else {
+        __ ReverseByteOrderAndStoreUnalignedFloat64(data_pointer, index, value);
+      }
     } else {
+      Label done;
+      ZoneLabelRef keep_byte_order(masm), reverse_byte_order(masm);
+      // TODO(leszeks): We're likely to be calling this on an existing boolean
+      // -- maybe that's a case we should fast-path here and reuse that boolean
+      // value?
+      __ ToBoolean(
+          ToRegister(IsLittleEndianInput()), CheckType::kCheckHeapObject,
+          V8_TARGET_BIG_ENDIAN_BOOL ? reverse_byte_order : keep_byte_order,
+          V8_TARGET_BIG_ENDIAN_BOOL ? keep_byte_order : reverse_byte_order,
+          true);
+      __ bind(*keep_byte_order);
+      __ StoreUnalignedFloat64(data_pointer, index, value);
+      __ Jump(&done);
+      // We should swap the bytes if big endian.
+      __ bind(*reverse_byte_order);
       __ ReverseByteOrderAndStoreUnalignedFloat64(data_pointer, index, value);
+      __ bind(&done);
     }
   } else {
-    Label done;
-    ZoneLabelRef keep_byte_order(masm), reverse_byte_order(masm);
-    // TODO(leszeks): We're likely to be calling this on an existing boolean --
-    // maybe that's a case we should fast-path here and reuse that boolean
-    // value?
-    __ ToBoolean(
-        ToRegister(IsLittleEndianInput()), CheckType::kCheckHeapObject,
-        V8_TARGET_BIG_ENDIAN_BOOL ? reverse_byte_order : keep_byte_order,
-        V8_TARGET_BIG_ENDIAN_BOOL ? keep_byte_order : reverse_byte_order, true);
-    __ bind(*keep_byte_order);
-    __ StoreUnalignedFloat64(data_pointer, index, value);
-    __ Jump(&done);
-    // We should swap the bytes if big endian.
-    __ bind(*reverse_byte_order);
-    __ ReverseByteOrderAndStoreUnalignedFloat64(data_pointer, index, value);
-    __ bind(&done);
+    DCHECK_EQ(external_array_type(), ExternalArrayType::kExternalFloat32Array);
+    if (IsIsLittleEndianInputConstant()) {
+      if (FromConstantToBool(masm, IsLittleEndianInput().node()) !=
+          V8_TARGET_BIG_ENDIAN_BOOL) {
+        __ StoreUnalignedFloat32(data_pointer, index, value);
+      } else {
+        __ ReverseByteOrderAndStoreUnalignedFloat32(data_pointer, index, value);
+      }
+    } else {
+      Label done;
+      ZoneLabelRef keep_byte_order(masm), reverse_byte_order(masm);
+      __ ToBoolean(
+          ToRegister(IsLittleEndianInput()), CheckType::kCheckHeapObject,
+          V8_TARGET_BIG_ENDIAN_BOOL ? reverse_byte_order : keep_byte_order,
+          V8_TARGET_BIG_ENDIAN_BOOL ? keep_byte_order : reverse_byte_order,
+          true);
+      __ bind(*keep_byte_order);
+      __ StoreUnalignedFloat32(data_pointer, index, value);
+      __ Jump(&done);
+      // We should swap the bytes if big endian.
+      __ bind(*reverse_byte_order);
+      __ ReverseByteOrderAndStoreUnalignedFloat32(data_pointer, index, value);
+      __ bind(&done);
+    }
   }
 }
 
@@ -5929,30 +6106,75 @@ void StoreFloat64::GenerateCode(MaglevAssembler* masm,
   __ StoreFloat64(FieldMemOperand(object, offset()), value);
 }
 
+namespace {
+
+// The 32 bits that {StoreInt32} writes for a constant value input, i.e. the
+// low 32 bits of what loading the constant into a register would produce.
+// Inlined allocations pass Smi constants unconverted for raw fields that hold
+// a Smi-encoded length.
+std::optional<int32_t> TryGetInt32ConstantForStoring(ValueNode* value) {
+  switch (value->opcode()) {
+    case Opcode::kInt32Constant:
+      return value->Cast<Int32Constant>()->value();
+    case Opcode::kUint32Constant:
+      return static_cast<int32_t>(value->Cast<Uint32Constant>()->value());
+    case Opcode::kSmiConstant:
+      return static_cast<int32_t>(
+          static_cast<intptr_t>(value->Cast<SmiConstant>()->value().ptr()));
+    default:
+      return {};
+  }
+}
+
+}  // namespace
+
 void StoreInt32::SetValueLocationConstraints() {
   UseRegister(ObjectInput());
-  UseRegister(ValueInput());
+  if (TryGetInt32ConstantForStoring(ValueInput().node())) {
+    // Stored as an immediate, so no register is needed for the value.
+    UseAny(ValueInput());
+  } else {
+    UseRegister(ValueInput());
+  }
 }
 void StoreInt32::GenerateCode(MaglevAssembler* masm,
                               const ProcessingState& state) {
   Register object = ToRegister(ObjectInput());
-  Register value = ToRegister(ValueInput());
 
   __ AssertNotSmi(object);
+  if (ValueInput().operand().IsConstant()) {
+    __ StoreInt32Field(object, offset(),
+                       *TryGetInt32ConstantForStoring(ValueInput().node()));
+    return;
+  }
+  Register value = ToRegister(ValueInput());
   __ StoreInt32(FieldMemOperand(object, offset()), value);
 }
 
 void StoreTaggedFieldNoWriteBarrier::SetValueLocationConstraints() {
   UseRegister(ObjectInput());
-  UseRegister(ValueInput());
+  if (MaglevAssembler::CanStoreTaggedConstant(ValueInput().node())) {
+    // The constant is stored as an immediate and needs no register.
+    UseAny(ValueInput());
+  } else {
+    UseRegister(ValueInput());
+  }
 }
 void StoreTaggedFieldNoWriteBarrier::GenerateCode(
     MaglevAssembler* masm, const ProcessingState& state) {
   Register object = ToRegister(ObjectInput());
-  Register value = ToRegister(ValueInput());
 
   __ AssertNotSmi(object);
 
+  if (ValueInput().operand().IsConstant()) {
+    ValueNode* constant = ValueInput().node();
+    DCHECK(MaglevAssembler::CanStoreTaggedConstant(constant));
+    __ StoreTaggedFieldNoWriteBarrier(object, offset(), constant);
+    __ AssertElidedWriteBarrier(object, constant, register_snapshot());
+    return;
+  }
+
+  Register value = ToRegister(ValueInput());
   __ StoreTaggedFieldNoWriteBarrier(object, offset(), value);
   __ AssertElidedWriteBarrier(object, value, register_snapshot());
 }
@@ -6601,8 +6823,8 @@ void Float64ToString::GenerateCode(MaglevAssembler* masm,
   masm->DefineLazyDeoptPoint(this->lazy_deopt_info());
 }
 
-int ThrowReferenceErrorIfHole::MaxCallStackArgs() const { return 1; }
-void ThrowReferenceErrorIfHole::SetValueLocationConstraints() {
+int ThrowReferenceErrorIfTdzHole::MaxCallStackArgs() const { return 1; }
+void ThrowReferenceErrorIfTdzHole::SetValueLocationConstraints() {
   // MaglevAssembler::IsRootConstant (used in GenerateCode below) does not
   // support constant inputs (which UseAny allows). Constants should have been
   // optimized already by MaglevGraphBuilder or MaglevGraphOptimizer.
@@ -6610,11 +6832,18 @@ void ThrowReferenceErrorIfHole::SetValueLocationConstraints() {
 
   UseAny(ValueInput());
 }
-void ThrowReferenceErrorIfHole::GenerateCode(MaglevAssembler* masm,
-                                             const ProcessingState& state) {
+void ThrowReferenceErrorIfTdzHole::GenerateCode(MaglevAssembler* masm,
+                                                const ProcessingState& state) {
+#ifdef V8_ENABLE_TDZ_HOLE
+  if (v8_flags.debug_code) {
+    __ Assert(NegateCondition(
+                  __ IsRootConstant(ValueInput(), RootIndex::kTheHoleValue)),
+              AbortReason::kUnexpectedValue);
+  }
+#endif
   __ JumpToDeferredIf(
-      __ IsRootConstant(ValueInput(), RootIndex::kTheHoleValue),
-      [](MaglevAssembler* masm, ThrowReferenceErrorIfHole* node) {
+      __ IsRootConstant(ValueInput(), RootIndex::kTdzHoleValue),
+      [](MaglevAssembler* masm, ThrowReferenceErrorIfTdzHole* node) {
         __ Push(node->name().object());
         __ Move(kContextRegister, masm->native_context().object());
         __ CallRuntime(Runtime::kThrowAccessedUninitializedVariable, 1);
@@ -6624,8 +6853,8 @@ void ThrowReferenceErrorIfHole::GenerateCode(MaglevAssembler* masm,
       this);
 }
 
-int ThrowSuperNotCalledIfHole::MaxCallStackArgs() const { return 0; }
-void ThrowSuperNotCalledIfHole::SetValueLocationConstraints() {
+int ThrowSuperNotCalledIfTdzHole::MaxCallStackArgs() const { return 0; }
+void ThrowSuperNotCalledIfTdzHole::SetValueLocationConstraints() {
   // MaglevAssembler::IsRootConstant (used in GenerateCode below) does not
   // support constant inputs (which UseAny allows). Constants should have been
   // optimized already by MaglevGraphBuilder or MaglevGraphOptimizer.
@@ -6633,11 +6862,18 @@ void ThrowSuperNotCalledIfHole::SetValueLocationConstraints() {
 
   UseAny(ValueInput());
 }
-void ThrowSuperNotCalledIfHole::GenerateCode(MaglevAssembler* masm,
-                                             const ProcessingState& state) {
+void ThrowSuperNotCalledIfTdzHole::GenerateCode(MaglevAssembler* masm,
+                                                const ProcessingState& state) {
+#ifdef V8_ENABLE_TDZ_HOLE
+  if (v8_flags.debug_code) {
+    __ Assert(NegateCondition(
+                  __ IsRootConstant(ValueInput(), RootIndex::kTheHoleValue)),
+              AbortReason::kUnexpectedValue);
+  }
+#endif
   __ JumpToDeferredIf(
-      __ IsRootConstant(ValueInput(), RootIndex::kTheHoleValue),
-      [](MaglevAssembler* masm, ThrowSuperNotCalledIfHole* node) {
+      __ IsRootConstant(ValueInput(), RootIndex::kTdzHoleValue),
+      [](MaglevAssembler* masm, ThrowSuperNotCalledIfTdzHole* node) {
         __ Move(kContextRegister, masm->native_context().object());
         __ CallRuntime(Runtime::kThrowSuperNotCalled, 0);
         masm->DefineExceptionHandlerAndLazyDeoptPoint(node);
@@ -6646,8 +6882,8 @@ void ThrowSuperNotCalledIfHole::GenerateCode(MaglevAssembler* masm,
       this);
 }
 
-int ThrowSuperAlreadyCalledIfNotHole::MaxCallStackArgs() const { return 0; }
-void ThrowSuperAlreadyCalledIfNotHole::SetValueLocationConstraints() {
+int ThrowSuperAlreadyCalledIfNotTdzHole::MaxCallStackArgs() const { return 0; }
+void ThrowSuperAlreadyCalledIfNotTdzHole::SetValueLocationConstraints() {
   // MaglevAssembler::IsRootConstant (used in GenerateCode below) does not
   // support constant inputs (which UseAny allows). Constants should have been
   // optimized already by MaglevGraphBuilder or MaglevGraphOptimizer.
@@ -6655,12 +6891,19 @@ void ThrowSuperAlreadyCalledIfNotHole::SetValueLocationConstraints() {
 
   UseAny(ValueInput());
 }
-void ThrowSuperAlreadyCalledIfNotHole::GenerateCode(
+void ThrowSuperAlreadyCalledIfNotTdzHole::GenerateCode(
     MaglevAssembler* masm, const ProcessingState& state) {
+#ifdef V8_ENABLE_TDZ_HOLE
+  if (v8_flags.debug_code) {
+    __ Assert(NegateCondition(
+                  __ IsRootConstant(ValueInput(), RootIndex::kTheHoleValue)),
+              AbortReason::kUnexpectedValue);
+  }
+#endif
   __ JumpToDeferredIf(
       NegateCondition(
-          __ IsRootConstant(ValueInput(), RootIndex::kTheHoleValue)),
-      [](MaglevAssembler* masm, ThrowSuperAlreadyCalledIfNotHole* node) {
+          __ IsRootConstant(ValueInput(), RootIndex::kTdzHoleValue)),
+      [](MaglevAssembler* masm, ThrowSuperAlreadyCalledIfNotTdzHole* node) {
         __ Move(kContextRegister, masm->native_context().object());
         __ CallRuntime(Runtime::kThrowSuperAlreadyCalledError, 0);
         masm->DefineExceptionHandlerAndLazyDeoptPoint(node);
@@ -8016,6 +8259,18 @@ void GenerateTypedArrayLoadFromDataPointer(MaglevAssembler* masm,
   }
 }
 
+void RetainConstantTypedArrayBuffer(MaglevAssembler* masm,
+                                    compiler::JSTypedArrayRef typed_array) {
+  // The constant typed array comes from a constant-folded source (property
+  // cell, const field, ...) which holds it strongly, and the code depends on
+  // that source not changing. So the buffer behind the embedded data pointer
+  // cannot die while this code is valid. Embed the buffer anyway as defense in
+  // depth: with this weak reference, the code is deoptimized when the buffer
+  // dies.
+  masm->code_gen_state()->Retain(
+      typed_array.buffer(masm->compilation_info()->broker()).object());
+}
+
 template <typename ResultReg>
 void GenerateTypedArrayLoad(MaglevAssembler* masm, Register object,
                             Register index, ResultReg result_reg,
@@ -8043,6 +8298,8 @@ void GenerateConstantTypedArrayLoad(MaglevAssembler* masm,
                                     compiler::JSTypedArrayRef typed_array,
                                     Register index, ResultReg result_reg,
                                     ElementsKind kind) {
+  RetainConstantTypedArrayBuffer(masm, typed_array);
+
   MaglevAssembler::TemporaryRegisterScope temps(masm);
   Register data_pointer = temps.Acquire();
   __ Move(data_pointer, reinterpret_cast<intptr_t>(typed_array.data_ptr()));
@@ -8104,6 +8361,8 @@ void GenerateConstantTypedArrayStore(MaglevAssembler* masm,
                                      compiler::JSTypedArrayRef typed_array,
                                      Register index, ValueReg value,
                                      ElementsKind elements_kind) {
+  RetainConstantTypedArrayBuffer(masm, typed_array);
+
   MaglevAssembler::TemporaryRegisterScope temps(masm);
   Register data_pointer = temps.Acquire();
 

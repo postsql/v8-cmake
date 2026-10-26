@@ -162,7 +162,7 @@ RUNTIME_FUNCTION(Runtime_DeclareModuleExports) {
     Tagged<Object> value;
     if (IsSmi(decl)) {
       index = Smi::ToInt(decl);
-      value = ReadOnlyRoots(isolate).the_hole_value();
+      value = ReadOnlyRoots(isolate).tdz_hole_value();
     } else {
       DirectHandle<SharedFunctionInfo> sfi(
           Cast<SharedFunctionInfo>(declarations->get(i)), isolate);
@@ -222,10 +222,7 @@ RUNTIME_FUNCTION(Runtime_DeclareGlobals) {
     // Compute the property attributes. According to ECMA-262,
     // the property must be non-configurable except in eval.
     Tagged<Script> script = Cast<Script>(closure->shared()->script());
-    PropertyAttributes attr =
-        script->compilation_type() == Script::CompilationType::kEval
-            ? NONE
-            : DONT_DELETE;
+    PropertyAttributes attr = script->is_eval() ? NONE : DONT_DELETE;
 
     // https://tc39.es/ecma262/#sec-globaldeclarationinstantiation 5.d:
     // If hasRestrictedGlobal is true, throw a SyntaxError exception.
@@ -841,13 +838,13 @@ MaybeDirectHandle<Object> LoadLookupSlot(
     Handle<Object> receiver = isolate->factory()->undefined_value();
     // Check for uninitialized bindings.
     if (flag == kNeedsInitialization &&
-        holder_context->IsElementTheHole(index)) {
+        holder_context->IsElementTdzHole(index)) {
       THROW_NEW_ERROR(isolate,
                       NewReferenceError(MessageTemplate::kNotDefined, name));
     }
     if (receiver_return) *receiver_return = receiver;
     DirectHandle<Object> value = Context::Get(holder_context, index, isolate);
-    DCHECK(!IsTheHole(*value));
+    DCHECK(!IsTdzHole(*value));
     return value;
   }
 
@@ -962,7 +959,7 @@ MaybeDirectHandle<Object> StoreLookupSlot(
   if (index != Context::kNotFound) {
     auto holder_context = Cast<Context>(holder);
     if (flag == kNeedsInitialization &&
-        holder_context->IsElementTheHole(index)) {
+        holder_context->IsElementTdzHole(index)) {
       THROW_NEW_ERROR(isolate,
                       NewReferenceError(MessageTemplate::kNotDefined, name));
     }

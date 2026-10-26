@@ -514,6 +514,7 @@ using DebugObjectCache = std::vector<Handle<HeapObject>>;
     wasm_custom_descriptors_enabled_callback, nullptr)                      \
   V(IsJSApiWrapperNativeErrorCallback,                                      \
     is_js_api_wrapper_native_error_callback, nullptr)                       \
+  V(ArrayBufferDetachCallback, array_buffer_detach_callback, nullptr)       \
   /* State for Relocatable. */                                              \
   V(Relocatable*, relocatable_top, nullptr)                                 \
   V(DebugObjectCache*, string_stream_debug_object_cache, nullptr)           \
@@ -1079,7 +1080,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   void OnPromiseAfter(DirectHandle<JSPromise> promise);
   void OnStackTraceCaptured(DirectHandle<StackTraceInfo> stack_trace);
   void OnTerminationDuringRunMicrotasks();
-#ifdef V8_CPPGC_MICROTASK_QUEUE
   // Remove dead microtask queues from the list.
   void CompactMicrotaskQueues();
   void RegisterMicrotaskQueue(MicrotaskQueue* queue);
@@ -1088,7 +1088,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
       const {
     return microtask_queues_;
   }
-#endif  // V8_CPPGC_MICROTASK_QUEUE
 
   // Re-throw an exception.  This involves no error reporting since error
   // reporting was handled when the exception was thrown originally.
@@ -1799,6 +1798,11 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   // compile dispatcher's queue.
   void AbortConcurrentOptimization(BlockingBehavior blocking_behavior);
 
+  // Waits until all concurrent optimization jobs of this Isolate have
+  // finished. Finished jobs request an interrupt for installing their code, so
+  // they are finalized the next time interrupts are handled.
+  void WaitForConcurrentOptimizationJobs();
+
   int id() const { return id_; }
 
   bool was_locker_ever_used() const {
@@ -2123,6 +2127,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     }
   }
 
+  v8::CrashKey AllocateCrashKeyString(const char key[], CrashKeySize size);
   v8::CrashKey AddCrashKeyString(const char key[], CrashKeySize size,
                                  std::string_view value);
   void SetCrashKeyString(CrashKey crash_key, std::string_view value);
@@ -2843,14 +2848,10 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 #undef ISOLATE_FIELD_OFFSET
 #endif
 
-#ifdef V8_CPPGC_MICROTASK_QUEUE
   cppgc::Persistent<MicrotaskQueue> default_microtask_queue_;
   // This list is used for visiting Microtask objects within live
   // microtask queues during atomic pause.
   std::vector<cppgc::WeakPersistent<MicrotaskQueue>> microtask_queues_;
-#else
-  MicrotaskQueue* default_microtask_queue_ = nullptr;
-#endif  // V8_CPPGC_MICROTASK_QUEUE
 
   bool detailed_source_positions_for_profiling_;
   bool preprocessing_exception_ = false;

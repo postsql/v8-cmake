@@ -723,6 +723,8 @@ void EnsureInfosArrayOnScript(DirectHandle<Script> script,
 void UpdateSharedFunctionFlagsAfterCompilation(FunctionLiteral* literal) {
   Tagged<SharedFunctionInfo> shared_info = *literal->shared_function_info();
   DCHECK_EQ(shared_info->language_mode(), literal->language_mode());
+  DCHECK_EQ(shared_info->syntax_kind(), literal->syntax_kind());
+  DCHECK_EQ(shared_info->kind(), literal->kind());
 
   // These fields are all initialised in ParseInfo from the SharedFunctionInfo,
   // and then set back on the literal after parse. Hence, they should already
@@ -2154,7 +2156,7 @@ class ConstantPoolPointerForwarder {
     if (!sfi->HasOuterScopeInfo()) return;
 
     Tagged<ScopeInfo> parent =
-        sfi->scope_info()->IsEmpty() ? Tagged<ScopeInfo>() : sfi->scope_info();
+        sfi->HasScopeInfo() ? sfi->scope_info() : Tagged<ScopeInfo>();
     Tagged<ScopeInfo> outer_info = sfi->GetOuterScopeInfo();
 
     auto it = scope_infos_to_update_.find(outer_info->UniqueIdInScript());
@@ -2379,7 +2381,7 @@ void VerifyCodeMerge(Isolate* isolate, DirectHandle<Script> script) {
         }
       }
 
-      if (!sfi->scope_info()->IsEmpty()) {
+      if (sfi->HasScopeInfo()) {
         scope_info = sfi->scope_info();
       } else if (sfi->HasOuterScopeInfo()) {
         scope_info = sfi->GetOuterScopeInfo();
@@ -2493,9 +2495,8 @@ void BackgroundMergeTask::BeginMergeInBackground(
           // Also push the old_sfi to make sure it stays alive / isn't replaced.
           new_compiled_data_for_cached_sfis_.push_back(
               {old_sfi_handle, local_heap->NewPersistentHandle(new_sfi)});
-          Tagged<ScopeInfo> info = old_sfi->scope_info();
-          if (!info->IsEmpty()) {
-            new_sfi->SetScopeInfo(info);
+          if (old_sfi->HasScopeInfo()) {
+            new_sfi->SetScopeInfo(old_sfi->scope_info());
           } else {
             Tagged<ScopeInfo> outer_info = old_sfi->TryGetOuterScopeInfo();
             if (!outer_info->IsEmpty()) {
@@ -2525,7 +2526,7 @@ void BackgroundMergeTask::BeginMergeInBackground(
       Tagged<SharedFunctionInfo> sfi;
       if (TryCast<SharedFunctionInfo>(maybe_old_info.GetHeapObjectAssumeWeak(),
                                       &sfi)) {
-        if (sfi->scope_info()->IsEmpty()) {
+        if (!sfi->HasScopeInfo()) {
           sfis_without_scope_info_.insert(i);
         }
       }
@@ -2714,6 +2715,9 @@ MaybeHandle<SharedFunctionInfo> BackgroundCompileTask::FinalizeScript(
   */
   Tagged<WeakFixedArray> infos = script->infos();
   uint32_t length = infos->ulength().value();
+  bool may_have_parallel_tasks =
+      flags_.post_parallel_compile_tasks_for_eager_toplevel() ||
+      flags_.post_parallel_compile_tasks_for_lazy();
   for (uint32_t i = 0; i < length; ++i) {
     Tagged<MaybeObject> maybe_obj = infos->get(i);
     Tagged<HeapObject> obj;
@@ -2721,10 +2725,16 @@ MaybeHandle<SharedFunctionInfo> BackgroundCompileTask::FinalizeScript(
     if (Tagged<SharedFunctionInfo> shared; TryCast(obj, &shared)) {
       // Once all compilation jobs are over, and before merging, we expect that
       // a function is either compiled (HasBytecodeArray) or is ready for lazy
-      // compilation (HasUncompiledData). Function here are all user defined
-      // functions and should not have a builtin_id.
-      DCHECK(!shared->HasBuiltinId());
-      DCHECK(shared->HasBytecodeArray() || shared->HasUncompiledData(isolate));
+      // compilation (HasUncompiledData). Functions here are all user defined
+      // functions and should not have a builtin_id (unless parallel compilation
+      // is enabled and the function is still in the dispatcher queue).
+      DCHECK_IMPLIES(!may_have_parallel_tasks, !shared->HasBuiltinId());
+      DCHECK_IMPLIES(may_have_parallel_tasks,
+                     !shared->HasBuiltinId() ||
+                         shared->builtin_id() == Builtin::kCompileLazy);
+      DCHECK(shared->HasBytecodeArray() || shared->HasUncompiledData(isolate) ||
+             (may_have_parallel_tasks &&
+              shared->builtin_id() == Builtin::kCompileLazy));
     }
   }
 #endif
@@ -2842,8 +2852,8 @@ void BackgroundDeserializeTask::Run() {
   LocalHandleScope handle_scope(&isolate);
 
   DirectHandle<SharedFunctionInfo> inner_result;
-  off_thread_data_ =
-      CodeSerializer::StartDeserializeOffThread(&isolate, &cached_data_);
+  CodeSerializer::StartDeserializeOffThread(&isolate, &cached_data_,
+                                            &off_thread_data_);
   if (v8_flags.enable_slow_asserts && off_thread_data_.HasResult()) {
 #ifdef ENABLE_SLOW_DCHECKS
     MergeAssumptionChecker checker(&isolate, false);
@@ -2856,6 +2866,11 @@ void BackgroundDeserializeTask::SourceTextAvailable(
     Isolate* isolate, Handle<String> source_text,
     const ScriptDetails& script_details) {
   DCHECK_EQ(isolate, isolate_for_local_isolate_);
+  if (!CodeSerializer::NotifySourceTextAvailable(isolate, &off_thread_data_,
+                                                 &cached_data_, source_text,
+                                                 script_details)) {
+    return;
+  }
   LanguageMode language_mode = construct_language_mode(v8_flags.use_strict);
   background_merge_task_.SetUpOnMainThread(isolate, source_text, script_details,
                                            language_mode);
@@ -3376,6 +3391,15 @@ MaybeDirectHandle<JSFunction> Compiler::GetFunctionFromEval(
     script = parse_info.CreateScript(
         isolate, source, kNullMaybeHandle,
         OriginOptionsForEval(outer_info->script(), parsing_while_debugging));
+    script->set_outer_language_mode(language_mode);
+    if (eval_position == kNoSourcePosition) {
+      script->set_compilation_kind(
+          restriction == ONLY_SINGLE_FUNCTION_LITERAL
+              ? Script::CompilationKind::kFunctionConstructor
+              : Script::CompilationKind::kIndirectEval);
+    } else {
+      script->set_compilation_kind(Script::CompilationKind::kDirectEval);
+    }
     script->set_eval_from_shared(*outer_info);
     if (eval_position == kNoSourcePosition) {
       // If the position is missing, attempt to get the code offset by

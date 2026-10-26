@@ -7,18 +7,15 @@
 
 #include <stdint.h>
 
+#include <type_traits>
 #include <vector>
 
-#include "v8-data.h"          // NOLINT(build/include_directory)
-#include "v8-local-handle.h"  // NOLINT(build/include_directory)
-#include "v8-maybe.h"         // NOLINT(build/include_directory)
-#include "v8-snapshot.h"      // NOLINT(build/include_directory)
-#include "v8config.h"         // NOLINT(build/include_directory)
-
-namespace cppgc {
-template <typename T>
-class GarbageCollected;
-}  // namespace cppgc
+#include "cppgc/type-traits.h"  // NOLINT(build/include_directory)
+#include "v8-data.h"            // NOLINT(build/include_directory)
+#include "v8-local-handle.h"    // NOLINT(build/include_directory)
+#include "v8-maybe.h"           // NOLINT(build/include_directory)
+#include "v8-snapshot.h"        // NOLINT(build/include_directory)
+#include "v8config.h"           // NOLINT(build/include_directory)
 
 namespace v8 {
 
@@ -321,38 +318,22 @@ class V8_EXPORT Context : public Data {
    */
   V8_INLINE void* GetAlignedPointerFromEmbedderData(Isolate* isolate, int index,
                                                     EmbedderDataTypeTag tag);
-  V8_INLINE void* GetAlignedPointerFromEmbedderData(int index,
-                                                    EmbedderDataTypeTag tag);
+  void* GetAlignedPointerFromEmbedderData(int index,
+                                          EmbedderDataTypeTag tag);
   template <typename T>
-    requires std::is_base_of_v<cppgc::GarbageCollected<T>, T>
+    requires cppgc::IsGarbageCollectedTypeV<T>
   V8_INLINE T* GetAlignedPointerFromEmbedderData(Isolate* isolate, int index,
-                                                CppHeapPointerTag tag) {
-    // TODO(ahaas): This is a temporary implementation, the actual
-    // implementation will follow with the refactoring of EmbedderDataSlots.
-    // The refactoring will regress the existing API, as the fast path will move
-    // to this new API.
-    // By using this temporary implementation, blink's ScriptState can already
-    // switch to the new API, and thereby switch from the old fast path to the
-    // new fast path directly.
-    return static_cast<T*>(GetAlignedPointerFromEmbedderData(
-        isolate, index, kEmbedderDataTypeTagDefault));
-  }
+                                                 CppHeapPointerTag tag);
 
   void SetAlignedPointerInEmbedderData(int index, void* value,
                                        EmbedderDataTypeTag tag);
 
   template <typename T>
-    requires std::is_base_of_v<cppgc::GarbageCollected<T>, T>
+    requires(!std::is_void_v<T>) && cppgc::IsGarbageCollectedTypeV<T>
   void SetAlignedPointerInEmbedderData(int index, T* value,
                                        CppHeapPointerTag tag) {
-    // TODO(ahaas): This is a temporary implementation, the actual
-    // implementation will follow with the refactoring of EmbedderDataSlots.
-    // The refactoring will regress the existing API, as the fast path will move
-    // to this new API.
-    // By using this temporary implementation, blink's ScriptState can already
-    // switch to the new API, and thereby switch from the old fast path to the
-    // new fast path directly.
-    SetAlignedPointerInEmbedderData(index, value, kEmbedderDataTypeTagDefault);
+    SetAlignedPointerInEmbedderDataInternal(index, static_cast<void*>(value),
+                                            tag);
   }
 
   /**
@@ -481,8 +462,9 @@ class V8_EXPORT Context : public Data {
       size_t index);
   Local<Value> SlowGetEmbedderData(int index);
   Local<Data> SlowGetEmbedderDataV2(int index);
-  void* SlowGetAlignedPointerFromEmbedderData(int index,
-                                              EmbedderDataTypeTag tag);
+  void* SlowGetAlignedPointerFromEmbedderData(int index, CppHeapPointerTag tag);
+  void SetAlignedPointerInEmbedderDataInternal(int index, void* value,
+                                               CppHeapPointerTag tag);
 };
 
 // --- Implementation ---
@@ -496,11 +478,15 @@ Local<Value> Context::GetEmbedderData(int index) {
       I::ReadTaggedPointerField(ctx, I::kNativeContextEmbedderDataOffset);
   int value_offset =
       I::kEmbedderDataArrayHeaderSize + (I::kEmbedderDataSlotSize * index);
-  A value = I::ReadRawField<A>(embedder_data, value_offset);
 #ifdef V8_COMPRESS_POINTERS
-  // We read the full pointer value and then decompress it in order to avoid
-  // dealing with potential endianness issues.
-  value = I::DecompressTaggedField(embedder_data, static_cast<uint32_t>(value));
+  // The tagged payload lives in the low kTaggedSize half of the slot (at
+  // kTaggedPayloadOffset == 0). Read it as a 32-bit field so the correct half
+  // is picked on both little and big endian targets. A full width read plus
+  // truncation would return the CppHeap pointer half on big endian.
+  uint32_t compressed = I::ReadRawField<uint32_t>(embedder_data, value_offset);
+  A value = I::DecompressTaggedField(embedder_data, compressed);
+#else
+  A value = I::ReadRawField<A>(embedder_data, value_offset);
 #endif
 
   auto* isolate = I::GetCurrentIsolate();
@@ -519,11 +505,15 @@ V8_INLINE Local<Data> Context::GetEmbedderDataV2(int index) {
       I::ReadTaggedPointerField(ctx, I::kNativeContextEmbedderDataOffset);
   int value_offset =
       I::kEmbedderDataArrayHeaderSize + (I::kEmbedderDataSlotSize * index);
-  A value = I::ReadRawField<A>(embedder_data, value_offset);
 #ifdef V8_COMPRESS_POINTERS
-  // We read the full pointer value and then decompress it in order to avoid
-  // dealing with potential endianness issues.
-  value = I::DecompressTaggedField(embedder_data, static_cast<uint32_t>(value));
+  // The tagged payload lives in the low kTaggedSize half of the slot (at
+  // kTaggedPayloadOffset == 0). Read it as a 32-bit field so the correct half
+  // is picked on both little and big endian targets. A full-width read plus
+  // truncation would return the CppHeap pointer half on big endian.
+  uint32_t compressed = I::ReadRawField<uint32_t>(embedder_data, value_offset);
+  A value = I::DecompressTaggedField(embedder_data, compressed);
+#else
+  A value = I::ReadRawField<A>(embedder_data, value_offset);
 #endif
 
   auto* isolate = I::GetCurrentIsolate();
@@ -533,26 +523,15 @@ V8_INLINE Local<Data> Context::GetEmbedderDataV2(int index) {
 #endif
 }
 
-void* Context::GetAlignedPointerFromEmbedderData(Isolate* isolate, int index,
-                                                 EmbedderDataTypeTag tag) {
-#if !defined(V8_ENABLE_CHECKS)
-  using A = internal::Address;
-  using I = internal::Internals;
-  A ctx = internal::ValueHelper::ValueAsAddress(this);
-  A embedder_data =
-      I::ReadTaggedPointerField(ctx, I::kNativeContextEmbedderDataOffset);
-  int value_offset = I::kEmbedderDataArrayHeaderSize +
-                     (I::kEmbedderDataSlotSize * index) +
-                     I::kEmbedderDataSlotExternalPointerOffset;
-  return reinterpret_cast<void*>(I::ReadExternalPointerField(
-      isolate, embedder_data, value_offset, ToExternalPointerTag(tag)));
-#else
-  return SlowGetAlignedPointerFromEmbedderData(index, tag);
-#endif
+V8_INLINE void* Context::GetAlignedPointerFromEmbedderData(
+    Isolate* isolate, int index, EmbedderDataTypeTag tag) {
+  return GetAlignedPointerFromEmbedderData(index, tag);
 }
 
-void* Context::GetAlignedPointerFromEmbedderData(int index,
-                                                 EmbedderDataTypeTag tag) {
+template <typename T>
+  requires cppgc::IsGarbageCollectedTypeV<T>
+T* Context::GetAlignedPointerFromEmbedderData(Isolate* isolate, int index,
+                                              CppHeapPointerTag tag) {
 #if !defined(V8_ENABLE_CHECKS)
   using A = internal::Address;
   using I = internal::Internals;
@@ -561,12 +540,11 @@ void* Context::GetAlignedPointerFromEmbedderData(int index,
       I::ReadTaggedPointerField(ctx, I::kNativeContextEmbedderDataOffset);
   int value_offset = I::kEmbedderDataArrayHeaderSize +
                      (I::kEmbedderDataSlotSize * index) +
-                     I::kEmbedderDataSlotExternalPointerOffset;
-  Isolate* isolate = I::GetCurrentIsolateForSandbox();
-  return reinterpret_cast<void*>(I::ReadExternalPointerField(
-      isolate, embedder_data, value_offset, ToExternalPointerTag(tag)));
+                     I::kEmbedderDataSlotCppHeapPointerOffset;
+  return internal::ReadCppHeapPointerField<T>(
+      isolate, embedder_data, value_offset, CppHeapPointerTagRange(tag, tag));
 #else
-  return SlowGetAlignedPointerFromEmbedderData(index, tag);
+  return static_cast<T*>(SlowGetAlignedPointerFromEmbedderData(index, tag));
 #endif
 }
 

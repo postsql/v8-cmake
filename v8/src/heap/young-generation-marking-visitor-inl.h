@@ -30,9 +30,7 @@ YoungGenerationMarkingVisitor<marking_mode>::YoungGenerationMarkingVisitor(
       isolate_(heap->isolate()),
       marking_worklists_local_(
           heap->minor_mark_sweep_collector()->marking_worklists(),
-          heap->cpp_heap()
-              ? CppHeap::From(heap->cpp_heap())->CreateCppMarkingState()
-              : MarkingWorklists::Local::kNoCppMarkingState),
+          CppHeap::From(heap->cpp_heap())->CreateCppMarkingState()),
       ephemeron_table_list_local_(
           *heap->minor_mark_sweep_collector()->ephemeron_table_list()),
       pretenuring_handler_(heap->pretenuring_handler()),
@@ -128,7 +126,7 @@ void YoungGenerationMarkingVisitor<marking_mode>::VisitExternalPointer(
   if (handle != kNullExternalPointerHandle) {
     ExternalPointerTable& table = isolate_->external_pointer_table();
     auto* space = isolate_->heap()->young_external_pointer_space();
-    table.Mark(space, handle, slot.address());
+    table.Mark(space, handle, slot.address(), slot.tag_range());
     if (slot.tag_range() == kArrayBufferExtensionTag) {
       maybe_extension = table.Get(handle, kArrayBufferExtensionTag);
     }

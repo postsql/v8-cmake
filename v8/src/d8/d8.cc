@@ -55,6 +55,7 @@
 #include "src/base/strong-alias.h"
 #include "src/base/sys-info.h"
 #include "src/base/utils/random-number-generator.h"
+#include "src/codegen/compilation-cache.h"
 #include "src/codegen/compiler.h"
 #include "src/compiler-dispatcher/optimizing-compile-dispatcher.h"
 #include "src/d8/d8-console.h"
@@ -173,20 +174,23 @@ Isolate::CreateParams GetDefaultIsolateCreateParams() {
   return create_params;
 }
 
-// Base class for shell ArrayBuffer allocators. It forwards all operations to
-// the default v8 allocator.
-class ArrayBufferAllocatorBase : public v8::ArrayBuffer::Allocator {
+// ArrayBuffer allocator that never allocates over 10MB.
+class MockArrayBufferAllocator : public v8::ArrayBuffer::Allocator {
  public:
+  explicit MockArrayBufferAllocator(v8::ArrayBuffer::Allocator* allocator)
+      : allocator_(allocator) {}
+
+ protected:
   void* Allocate(size_t length) override {
-    return allocator_->Allocate(length);
+    return allocator_->Allocate(Adjust(length));
   }
 
   void* AllocateUninitialized(size_t length) override {
-    return allocator_->AllocateUninitialized(length);
+    return allocator_->AllocateUninitialized(Adjust(length));
   }
 
   void Free(void* data, size_t length) override {
-    allocator_->Free(data, length);
+    allocator_->Free(data, Adjust(length));
   }
 
   PageAllocator* GetPageAllocator() override {
@@ -194,79 +198,23 @@ class ArrayBufferAllocatorBase : public v8::ArrayBuffer::Allocator {
   }
 
  private:
-  std::unique_ptr<Allocator> allocator_ =
-      std::unique_ptr<Allocator>(NewDefaultAllocator());
-};
-
-// ArrayBuffer allocator that can use virtual memory to improve performance.
-class ShellArrayBufferAllocator : public ArrayBufferAllocatorBase {
- public:
-  void* Allocate(size_t length) override {
-    if (length >= kVMThreshold) return AllocateVM(length);
-    return ArrayBufferAllocatorBase::Allocate(length);
-  }
-
-  void* AllocateUninitialized(size_t length) override {
-    if (length >= kVMThreshold) return AllocateVM(length);
-    return ArrayBufferAllocatorBase::AllocateUninitialized(length);
-  }
-
-  void Free(void* data, size_t length) override {
-    if (length >= kVMThreshold) {
-      FreeVM(data, length);
-    } else {
-      ArrayBufferAllocatorBase::Free(data, length);
-    }
-  }
-
- private:
-  static constexpr size_t kVMThreshold = 65536;
-
-  void* AllocateVM(size_t length) {
-    DCHECK_LE(kVMThreshold, length);
-    v8::PageAllocator* page_allocator = GetPageAllocator();
-    size_t page_size = page_allocator->AllocatePageSize();
-    size_t allocated = RoundUp(length, page_size);
-    return i::AllocatePages(page_allocator, allocated, page_size,
-                            PageAllocator::kReadWrite);
-  }
-
-  void FreeVM(void* data, size_t length) {
-    v8::PageAllocator* page_allocator = GetPageAllocator();
-    size_t page_size = page_allocator->AllocatePageSize();
-    size_t allocated = RoundUp(length, page_size);
-    i::FreePages(page_allocator, data, allocated);
-  }
-};
-
-// ArrayBuffer allocator that never allocates over 10MB.
-class MockArrayBufferAllocator : public ArrayBufferAllocatorBase {
- protected:
-  void* Allocate(size_t length) override {
-    return ArrayBufferAllocatorBase::Allocate(Adjust(length));
-  }
-
-  void* AllocateUninitialized(size_t length) override {
-    return ArrayBufferAllocatorBase::AllocateUninitialized(Adjust(length));
-  }
-
-  void Free(void* data, size_t length) override {
-    return ArrayBufferAllocatorBase::Free(data, Adjust(length));
-  }
-
- private:
   size_t Adjust(size_t length) {
     const size_t kAllocationLimit = 10 * i::MB;
     return length > kAllocationLimit ? i::AllocatePageSize() : length;
   }
+
+  v8::ArrayBuffer::Allocator* allocator_;
 };
 
 // ArrayBuffer allocator that can be equipped with a limit to simulate system
 // OOM.
-class MockArrayBufferAllocatiorWithLimit : public MockArrayBufferAllocator {
+class MockArrayBufferAllocatorWithLimit : public MockArrayBufferAllocator {
  public:
-  explicit MockArrayBufferAllocatiorWithLimit(size_t allocation_limit)
-      : limit_(allocation_limit), space_left_(allocation_limit) {}
+  MockArrayBufferAllocatorWithLimit(v8::ArrayBuffer::Allocator* allocator,
+                                    size_t allocation_limit)
+      : MockArrayBufferAllocator(allocator),
+        limit_(allocation_limit),
+        space_left_(allocation_limit) {}
 
  protected:
   void* Allocate(size_t length) override {
@@ -287,7 +235,7 @@ class MockArrayBufferAllocatiorWithLimit : public MockArrayBufferAllocator {
 
   void Free(void* data, size_t length) override {
     space_left_ += length;
-    return MockArrayBufferAllocator::Free(data, length);
+    MockArrayBufferAllocator::Free(data, length);
   }
 
   size_t MaxAllocationSize() const override { return limit_; }
@@ -307,11 +255,15 @@ class MockArrayBufferAllocatiorWithLimit : public MockArrayBufferAllocator {
 // The purpose is to allow stability-testing of huge (typed) arrays without
 // actually consuming huge amounts of physical memory.
 // This is currently only available on Linux because it relies on {mremap}.
-class MultiMappedAllocator : public ArrayBufferAllocatorBase {
+class MultiMappedAllocator : public v8::ArrayBuffer::Allocator {
+ public:
+  explicit MultiMappedAllocator(v8::ArrayBuffer::Allocator* allocator)
+      : allocator_(allocator) {}
+
  protected:
   void* Allocate(size_t length) override {
     if (length < kChunkSize) {
-      return ArrayBufferAllocatorBase::Allocate(length);
+      return allocator_->Allocate(length);
     }
     // We use mmap, which initializes pages to zero anyway.
     return AllocateUninitialized(length);
@@ -319,7 +271,7 @@ class MultiMappedAllocator : public ArrayBufferAllocatorBase {
 
   void* AllocateUninitialized(size_t length) override {
     if (length < kChunkSize) {
-      return ArrayBufferAllocatorBase::AllocateUninitialized(length);
+      return allocator_->AllocateUninitialized(length);
     }
     size_t rounded_length = RoundUp(length, kChunkSize);
     int prot = PROT_READ | PROT_WRITE;
@@ -393,7 +345,8 @@ class MultiMappedAllocator : public ArrayBufferAllocatorBase {
 
   void Free(void* data, size_t length) override {
     if (length < kChunkSize) {
-      return ArrayBufferAllocatorBase::Free(data, length);
+      allocator_->Free(data, length);
+      return;
     }
     base::MutexGuard lock_guard(&regions_mutex_);
     void* real_alloc = regions_[data];
@@ -408,10 +361,15 @@ class MultiMappedAllocator : public ArrayBufferAllocatorBase {
     regions_.erase(data);
   }
 
+  PageAllocator* GetPageAllocator() override {
+    return allocator_->GetPageAllocator();
+  }
+
  private:
   // Aiming for a "Huge Page" (2M on Linux x64) to go easy on the TLB.
   static constexpr size_t kChunkSize = 2 * 1024 * 1024;
 
+  v8::ArrayBuffer::Allocator* allocator_;
   std::unordered_map<void*, void*> regions_;
   base::Mutex regions_mutex_;
 };
@@ -663,8 +621,7 @@ std::unordered_set<std::shared_ptr<Worker>> Shell::running_workers_;
 std::atomic<bool> Shell::script_executed_{false};
 std::atomic<bool> Shell::valid_fuzz_script_{false};
 base::LazyMutex Shell::cached_code_mutex_;
-std::map<std::string, std::unique_ptr<ScriptCompiler::CachedData>>
-    Shell::cached_code_map_;
+Shell::CodeCacheMap Shell::cached_code_map_;
 std::atomic<int> Shell::unhandled_promise_rejections_{0};
 bool Shell::fuzzilli_reprl_failed_ = false;
 
@@ -681,14 +638,16 @@ ShellOptions Shell::options;
 base::OnceType Shell::quit_once_ = V8_ONCE_INIT;
 
 ScriptCompiler::CachedData* Shell::LookupCodeCache(Isolate* isolate,
-                                                   Local<Value> source) {
+                                                   Local<Value> source,
+                                                   ScriptType type) {
   i::ParkedMutexGuard lock_guard(
       reinterpret_cast<i::Isolate*>(isolate)->main_thread_local_isolate(),
       cached_code_mutex_.Pointer());
   CHECK(source->IsString());
-  v8::String::Utf8Value key(isolate, source);
-  DCHECK(*key);
-  auto entry = cached_code_map_.find(*key);
+  v8::String::Utf8Value source_str(isolate, source);
+  DCHECK(*source_str);
+  CodeCacheKey key(*source_str, type);
+  auto entry = cached_code_map_.find(key);
   if (entry != cached_code_map_.end() && entry->second) {
     int length = entry->second->length;
     uint8_t* cache = new uint8_t[length];
@@ -701,18 +660,20 @@ ScriptCompiler::CachedData* Shell::LookupCodeCache(Isolate* isolate,
 }
 
 void Shell::StoreInCodeCache(Isolate* isolate, Local<Value> source,
-                             const ScriptCompiler::CachedData* cache_data) {
+                             const ScriptCompiler::CachedData* cache_data,
+                             ScriptType type) {
   i::ParkedMutexGuard lock_guard(
       reinterpret_cast<i::Isolate*>(isolate)->main_thread_local_isolate(),
       cached_code_mutex_.Pointer());
   CHECK(source->IsString());
   if (cache_data == nullptr) return;
-  v8::String::Utf8Value key(isolate, source);
-  DCHECK(*key);
+  v8::String::Utf8Value source_str(isolate, source);
+  DCHECK(*source_str);
   int length = cache_data->length;
   uint8_t* cache = new uint8_t[length];
   memcpy(cache, cache_data->data, length);
-  cached_code_map_[*key] = std::unique_ptr<ScriptCompiler::CachedData>(
+  CodeCacheKey key(*source_str, type);
+  cached_code_map_[key] = std::unique_ptr<ScriptCompiler::CachedData>(
       new ScriptCompiler::CachedData(cache, length,
                                      ScriptCompiler::CachedData::BufferOwned));
 }
@@ -955,7 +916,13 @@ MaybeLocal<T> Shell::CompileSource(Isolate* isolate, Local<Context> context,
 
   ScriptCompiler::CachedData* cached_code = nullptr;
   if (options.compile_options & ScriptCompiler::kConsumeCodeCache) {
-    cached_code = LookupCodeCache(isolate, source_string);
+    if constexpr (std::is_same_v<T, Script>) {
+      cached_code =
+          LookupCodeCache(isolate, source_string, ScriptType::kClassic);
+    } else if constexpr (std::is_same_v<T, Module>) {
+      cached_code =
+          LookupCodeCache(isolate, source_string, ScriptType::kModule);
+    }
   }
   ScriptCompiler::Source script_source(source_string, origin, cached_code);
   MaybeLocal<T> result =
@@ -1074,6 +1041,10 @@ class ModuleEmbedderData {
 
   // Origin location used for resolving modules when referrer is null.
   std::string origin;
+
+  // List of compiled JavaScript modules awaiting code cache production.
+  std::vector<std::pair<Global<String>, Global<Module>>>
+      modules_pending_code_cache;
 };
 
 enum { kModuleEmbedderDataIndex, kInspectorClientIndex };
@@ -1186,6 +1157,10 @@ bool Shell::ExecuteSource(Isolate* isolate, const Source& source,
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
   if (i_isolate->is_execution_terminating()) return true;
 
+  HandleScope handle_scope(isolate);
+  TryCatch try_catch(isolate);
+  try_catch.SetVerbose(report_exceptions == kReportExceptions);
+
   Local<String> source_str;
   if (i::v8_flags.parse_only ||
       options.code_cache_options ==
@@ -1196,10 +1171,6 @@ bool Shell::ExecuteSource(Isolate* isolate, const Source& source,
       return false;
     }
   }
-
-  HandleScope handle_scope(isolate);
-  TryCatch try_catch(isolate);
-  try_catch.SetVerbose(report_exceptions == kReportExceptions);
 
   if (i::v8_flags.parse_only) {
     i::VMState<PARSER> state(i_isolate);
@@ -1620,6 +1591,19 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
              .ToLocal(&module)) {
       return MaybeLocal<Module>();
     }
+    if (options.code_cache_options ==
+        ShellOptions::CodeCacheOptions::kProduceCache) {
+      ScriptCompiler::CachedData* cached_data =
+          ScriptCompiler::CreateCodeCache(module->GetUnboundModuleScript());
+      StoreInCodeCache(isolate, source_text.ToLocalChecked(), cached_data,
+                       ScriptType::kModule);
+      delete cached_data;
+    } else if (options.code_cache_options ==
+               ShellOptions::CodeCacheOptions::kProduceCacheAfterExecute) {
+      module_data->modules_pending_code_cache.emplace_back(
+          Global<String>(isolate, source_text.ToLocalChecked()),
+          Global<Module>(isolate, module));
+    }
   } else if (module_type == ModuleType::kJSON) {
     Local<Value> parsed_json;
     if (!v8::JSON::Parse(context, source_text.ToLocalChecked())
@@ -1848,7 +1832,7 @@ void Shell::ModuleResolutionSuccessCallback(
   DCHECK(i::ValidateCallbackInfo(info));
   Isolate* isolate(info.GetIsolate());
   HandleScope handle_scope(isolate);
-  Local<Array> module_resolution_data(info.Data().As<Array>());
+  Local<Array> module_resolution_data(info.DataV2().As<Value>().As<Array>());
   Local<Context> context(isolate->GetCurrentContext());
 
   Local<Promise::Resolver> resolver(
@@ -1873,7 +1857,7 @@ void Shell::ModuleResolutionFailureCallback(
   DCHECK(i::ValidateCallbackInfo(info));
   Isolate* isolate(info.GetIsolate());
   HandleScope handle_scope(isolate);
-  Local<Array> module_resolution_data(info.Data().As<Array>());
+  Local<Array> module_resolution_data(info.DataV2().As<Value>().As<Array>());
   Local<Context> context(isolate->GetCurrentContext());
 
   Local<Promise::Resolver> resolver(
@@ -2194,6 +2178,30 @@ void Shell::DoHostImportModuleDynamically(v8::Local<v8::Data> data) {
   }
 }
 
+void Shell::ProduceModuleCodeCacheAfterExecute(Isolate* isolate) {
+  if (options.code_cache_options !=
+          ShellOptions::CodeCacheOptions::kProduceCacheAfterExecute ||
+      isolate->IsExecutionTerminating()) {
+    return;
+  }
+  PerIsolateData* data = PerIsolateData::Get(isolate);
+  Local<Context> realm =
+      data->realms_[data->realm_current_].context.Get(isolate);
+  Context::Scope context_scope(realm);
+  i::CppGCManaged<ModuleEmbedderData>::Ptr module_data =
+      GetModuleDataFromContext(realm);
+  for (const auto& [source_str, mod] :
+       module_data->modules_pending_code_cache) {
+    Local<Module> m = mod.Get(isolate);
+    ScriptCompiler::CachedData* cached_data =
+        ScriptCompiler::CreateCodeCache(m->GetUnboundModuleScript());
+    StoreInCodeCache(isolate, source_str.Get(isolate), cached_data,
+                     ScriptType::kModule);
+    delete cached_data;
+  }
+  module_data->modules_pending_code_cache.clear();
+}
+
 bool Shell::ExecuteModule(Isolate* isolate, const char* file_name) {
   HandleScope handle_scope(isolate);
   Global<Module> global_root_module;
@@ -2232,6 +2240,8 @@ bool Shell::ExecuteModule(Isolate* isolate, const char* file_name) {
     global_root_module.Reset(isolate, root_module);
 
     module_data->origin = absolute_path;
+
+    if (options.compile_only) return true;
 
     if (root_module
             ->InstantiateModule(realm, ResolveModuleCallback,
@@ -2305,6 +2315,8 @@ bool Shell::ExecuteModule(Isolate* isolate, const char* file_name) {
       return false;
     }
   }
+
+  ProduceModuleCodeCacheAfterExecute(isolate);
 
   DCHECK(!try_catch.HasCaught());
   return true;
@@ -2551,10 +2563,10 @@ int PerIsolateData::RealmIndexOrThrow(
 }
 
 // GetTimestamp() returns a time stamp as double, measured in milliseconds.
-// When v8_flags.verify_predictable mode is enabled it returns result of
+// When v8_flags.predictable mode is enabled it returns result of
 // v8::Platform::MonotonicallyIncreasingTime().
 double Shell::GetTimestamp() {
-  if (i::v8_flags.verify_predictable) {
+  if (i::v8_flags.predictable) {
     return g_platform->MonotonicallyIncreasingTime();
   } else {
     base::TimeDelta delta = base::TimeTicks::Now() - kInitialTicks;
@@ -2563,9 +2575,9 @@ double Shell::GetTimestamp() {
 }
 uint64_t Shell::GetTracingTimestampFromPerformanceTimestamp(
     double performance_timestamp) {
-  // Don't use this in --verify-predictable mode, predictable timestamps don't
+  // Don't use this in --predictable mode, predictable timestamps don't
   // work well with tracing.
-  DCHECK(!i::v8_flags.verify_predictable);
+  DCHECK(!i::v8_flags.predictable);
   base::TimeDelta delta =
       base::TimeDelta::FromMillisecondsD(performance_timestamp);
   // See TracingController::CurrentTimestampMicroseconds().
@@ -2912,19 +2924,9 @@ MaybeLocal<Context> Shell::CreateRealm(
   Local<ObjectTemplate> global_template = CreateGlobalTemplate(isolate);
 
   v8::MicrotaskQueue* microtask_queue = nullptr;
-#ifdef V8_CPPGC_MICROTASK_QUEUE
   if (create_own_microtask_queue) {
     microtask_queue = v8::MicrotaskQueue::New(isolate);
   }
-#else
-  std::unique_ptr<v8::MicrotaskQueue> new_mq;
-  if (create_own_microtask_queue) {
-    START_ALLOW_USE_DEPRECATED()
-    new_mq = v8::MicrotaskQueue::New(isolate);
-    END_ALLOW_USE_DEPRECATED()
-    microtask_queue = new_mq.get();
-  }
-#endif  // V8_CPPGC_MICROTASK_QUEUE
 
   Local<Context> context =
       Context::New(isolate, nullptr, global_template, global_object,
@@ -2935,16 +2937,9 @@ MaybeLocal<Context> Shell::CreateRealm(
 
   if (index < 0) {
     index = static_cast<int>(data->realms_.size());
-#ifdef V8_CPPGC_MICROTASK_QUEUE
     data->realms_.emplace_back(isolate, context);
-#else
-    data->realms_.emplace_back(isolate, context, std::move(new_mq));
-#endif
   } else {
     data->realms_[index].context.Reset(isolate, context);
-#ifndef V8_CPPGC_MICROTASK_QUEUE
-    data->realms_[index].microtask_queue = std::move(new_mq);
-#endif
   }
 
   data->realms_[index].context.AnnotateStrongRetainer(kGlobalHandleLabel);
@@ -2960,9 +2955,6 @@ void Shell::DisposeRealm(const v8::FunctionCallbackInfo<v8::Value>& info,
   PerIsolateData* data = PerIsolateData::Get(isolate);
   Local<Context> context = data->realms_[index].context.Get(isolate);
   data->realms_[index].context.Reset();
-#ifndef V8_CPPGC_MICROTASK_QUEUE
-  data->realms_[index].microtask_queue.reset();
-#endif
   context->DetachGlobal();
   // ContextDisposedNotification expects the disposed context to be entered.
   v8::Context::Scope scope(context);
@@ -3925,7 +3917,7 @@ void Shell::SetTimeout(const v8::FunctionCallbackInfo<v8::Value>& info) {
 void Shell::GetContinuationPreservedEmbedderData(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
   Isolate* isolate = info.GetIsolate();
-  Local<Data> data = isolate->GetContinuationPreservedEmbedderDataV2();
+  Local<Data> data = isolate->GetContinuationPreservedEmbedderData();
   DCHECK(!data.IsEmpty());
   if (!data->IsValue()) {
     data = Undefined(isolate);
@@ -5023,6 +5015,19 @@ Local<ObjectTemplate> Shell::CreateD8Template(Isolate* isolate) {
         isolate, "setFlushDenormals",
         FunctionTemplate::New(isolate, Shell::SetFlushDenormals));
 
+    test_template->Set(
+        isolate, "createInterceptorObject",
+        FunctionTemplate::New(isolate, Shell::CreateInterceptorObject));
+    test_template->Set(
+        isolate, "createAccessCheckedObject",
+        FunctionTemplate::New(isolate, Shell::CreateAccessCheckedObject));
+    test_template->Set(
+        isolate, "createAccessCheckedInterceptorObject",
+        FunctionTemplate::New(isolate,
+                              Shell::CreateAccessCheckedInterceptorObject));
+    test_template->Set(isolate, "setAccessPolicy",
+                       FunctionTemplate::New(isolate, Shell::SetAccessPolicy));
+
     d8_template->Set(isolate, "test", test_template);
   }
   {
@@ -6077,9 +6082,9 @@ class InspectorClient : public v8_inspector::V8InspectorClient {
 
   static const int kContextGroupId = 1;
 
+  std::unique_ptr<v8_inspector::V8Inspector::Channel> channel_;
   std::unique_ptr<v8_inspector::V8Inspector> inspector_;
   std::unique_ptr<v8_inspector::V8InspectorSession> session_;
-  std::unique_ptr<v8_inspector::V8Inspector::Channel> channel_;
   bool is_paused = false;
   Global<Context> context_;
   Isolate* isolate_ = nullptr;
@@ -6475,7 +6480,8 @@ Worker::Worker(Isolate* parent_isolate, const char* script,
                bool flush_denormals)
     : script_(i::StrDup(script)),
       flush_denormals_(flush_denormals),
-      parent_isolate_(parent_isolate) {
+      parent_isolate_(parent_isolate),
+      parent_task_runner_(g_platform->GetForegroundTaskRunner(parent_isolate)) {
   state_.store(State::kReady);
 }
 
@@ -6848,9 +6854,8 @@ void Worker::ExecuteInThread() {
   out_semaphore_.Signal();
   // Also post an cleanup task to the parent isolate, so that it sees that this
   // worker is terminated and can clean it up in a thread-safe way.
-  g_platform->GetForegroundTaskRunner(parent_isolate_)
-      ->PostTask(std::make_unique<CleanUpWorkerTask>(parent_isolate_,
-                                                     this->shared_from_this()));
+  parent_task_runner_->PostTask(std::make_unique<CleanUpWorkerTask>(
+      parent_isolate_, this->shared_from_this()));
 }
 
 void Worker::PostMessageOut(const v8::FunctionCallbackInfo<v8::Value>& info) {
@@ -6869,14 +6874,14 @@ void Worker::PostMessageOut(const v8::FunctionCallbackInfo<v8::Value>& info) {
   std::unique_ptr<SerializationData> data =
       Shell::SerializeValue(isolate, message, transfer);
   if (data) {
-    DCHECK(info.Data()->IsExternal());
-    Local<External> this_value = info.Data().As<External>();
+    DCHECK(info.DataV2().As<Value>()->IsExternal());
+    Local<External> this_value = info.DataV2().As<External>();
     Worker* worker = static_cast<Worker*>(this_value->Value(kWorkerTag));
 
     worker->out_queue_.Enqueue(std::move(data));
     worker->out_semaphore_.Signal();
-    g_platform->GetForegroundTaskRunner(worker->parent_isolate_)
-        ->PostTask(std::make_unique<CheckMessageFromWorkerTask>(
+    worker->parent_task_runner_->PostTask(
+        std::make_unique<CheckMessageFromWorkerTask>(
             worker->parent_isolate_, worker->shared_from_this()));
   }
 }
@@ -6889,8 +6894,8 @@ void Worker::Close(const v8::FunctionCallbackInfo<v8::Value>& info) {
   DCHECK(i::ValidateCallbackInfo(info));
   Isolate* isolate = info.GetIsolate();
   HandleScope handle_scope(isolate);
-  DCHECK(info.Data()->IsExternal());
-  Local<External> this_value = info.Data().As<External>();
+  DCHECK(info.DataV2().As<Value>()->IsExternal());
+  Local<External> this_value = info.DataV2().As<External>();
   Worker* worker = static_cast<Worker*>(this_value->Value(kWorkerTag));
   worker->Terminate();
 }
@@ -7269,6 +7274,17 @@ bool Shell::SetOptions(int argc, char* argv[]) {
   }
 #endif
 
+  if (options.compile_only &&
+      options.code_cache_options ==
+          ShellOptions::CodeCacheOptions::kProduceCacheAfterExecute) {
+    fprintf(stderr,
+            "Flag --compile-only is incompatible with --cache=after-execute:\n"
+            "  --compile-only: Only parse and compile; do not execute.\n"
+            "  --cache=after-execute: Execute first, then serialize and cache "
+            "the post-execution state.\n");
+    return false;
+  }
+
   const char* usage =
       "Synopsis:\n"
       "  shell [options] [--shell] [<file>...]\n"
@@ -7298,6 +7314,17 @@ bool Shell::SetOptions(int argc, char* argv[]) {
   if (i::v8_flags.stress_snapshot && options.expose_fast_api &&
       check_d8_flag_contradictions) {
     FATAL("Flag --expose-fast-api is incompatible with --stress-snapshot.");
+  }
+
+  if (options.trace_enabled && i::v8_flags.predictable) {
+    if (check_d8_flag_contradictions) {
+      FATAL("Flag --enable-tracing is incompatible with --predictable.");
+    } else {
+      fprintf(stderr,
+              "Warning: disabling flag --enable-tracing due to conflicting "
+              "flags\n");
+      options.trace_enabled = false;
+    }
   }
 
   // Set up isolated source groups.
@@ -7489,9 +7516,40 @@ void Shell::CollectGarbage(Isolate* isolate) {
 }
 
 namespace {
+
+// Concurrent compilation doesn't post a task when a job finishes; instead it
+// requests an interrupt which finalizes the job the next time JavaScript runs.
+// Since we might not run any JavaScript any more, wait for the jobs and install
+// their code explicitly. Returns true if any job was finalized.
+bool FinalizeBackgroundCompilationJobs(i::Isolate* i_isolate) {
+  i_isolate->WaitForConcurrentOptimizationJobs();
+  // Note that we must not handle the interrupts instead: we're not running
+  // JavaScript and there's no current context, which the handlers of the other
+  // interrupts (e.g. the API interrupt the inspector uses for pausing) rely on.
+  i::StackGuard* stack_guard = i_isolate->stack_guard();
+  bool has_finished_jobs = false;
+  if (stack_guard->CheckInstallCode()) {
+    stack_guard->ClearInstallCode();
+    i_isolate->optimizing_compile_dispatcher()->InstallOptimizedFunctions();
+    has_finished_jobs = true;
+  }
+#ifdef V8_ENABLE_MAGLEV
+  if (stack_guard->CheckInstallMaglevCode()) {
+    stack_guard->ClearInstallMaglevCode();
+    i_isolate->maglev_concurrent_dispatcher()->FinalizeFinishedJobs();
+    has_finished_jobs = true;
+  }
+#endif  // V8_ENABLE_MAGLEV
+  return has_finished_jobs;
+}
+
 bool ProcessMessages(
     Isolate* isolate,
-    const std::function<platform::MessageLoopBehavior()>& behavior) {
+    const std::function<platform::MessageLoopBehavior()>& behavior,
+    bool wait_for_background_tasks = false) {
+  // TODO(marja): now we need to pass the MessageLoopBehavior and
+  // wait_for_background_tasks separately - can they be merged?
+
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
   i::SaveAndSwitchContext saved_context(i_isolate, {});
   SealHandleScope shs(isolate);
@@ -7516,7 +7574,7 @@ bool ProcessMessages(
     // task queue of the {kProcessGlobalPredictablePlatformWorkerTaskQueue}
     // isolate. We execute all background tasks after running one foreground
     // task.
-    if (i::v8_flags.verify_predictable) {
+    if (i::v8_flags.predictable) {
       TryCatch inner_try_catch(isolate);
       inner_try_catch.SetVerbose(true);
       while (v8::platform::PumpMessageLoop(
@@ -7528,7 +7586,14 @@ bool ProcessMessages(
       }
     }
 
-    if (!ran_a_task) break;
+    if (!ran_a_task) {
+      if (!wait_for_background_tasks) break;
+      if (!FinalizeBackgroundCompilationJobs(i_isolate)) break;
+      if (isolate->IsExecutionTerminating()) {
+        return exit_with_success;
+      }
+      DCHECK(!try_catch.HasCaught());
+    }
   }
   if (g_default_platform->IdleTasksEnabled(isolate)) {
     v8::platform::RunIdleTasks(g_default_platform, isolate,
@@ -7551,7 +7616,7 @@ bool Shell::CompleteMessageLoop(Isolate* isolate) {
     }
     return platform::MessageLoopBehavior::kDoNotWait;
   };
-  if (i::v8_flags.verify_predictable) {
+  if (i::v8_flags.predictable) {
     bool ran_tasks = ProcessMessages(
         isolate, [] { return platform::MessageLoopBehavior::kDoNotWait; });
     if (get_waiting_behaviour() ==
@@ -7562,7 +7627,8 @@ bool Shell::CompleteMessageLoop(Isolate* isolate) {
     }
     return ran_tasks;
   }
-  return ProcessMessages(isolate, get_waiting_behaviour);
+  return ProcessMessages(isolate, get_waiting_behaviour,
+                         options.wait_for_background_tasks);
 }
 
 bool Shell::FinishExecuting(Isolate* isolate, const Global<Context>& context) {
@@ -7963,9 +8029,11 @@ int Shell::Main(int argc, char* argv[]) {
   v8::base::EnsureConsoleOutput();
 
   // TODO(40925855): Enable this more broadly outside of d8.
-#if defined(PA_ENABLE_USER_SPACE_ZERO_SEGMENT)
+#if defined(V8_ENABLE_PARTITION_ALLOC)
+#if PA_BUILDFLAG(ENABLE_USER_SPACE_ZERO_SEGMENT)
   i::v8_flags.sandbox_prohibit_insecure_mode = true;
-#endif
+#endif  // PA_BUILDFLAG(ENABLE_USER_SPACE_ZERO_SEGMENT)
+#endif  // defined(V8_ENABLE_PARTITION_ALLOC)
 
   if (!v8::Shell::SetOptions(argc, argv)) return 1;
 
@@ -8011,7 +8079,7 @@ int Shell::Main(int argc, char* argv[]) {
 
   std::ofstream trace_file;
   std::unique_ptr<platform::tracing::TracingController> tracing;
-  if (options.trace_enabled && !i::v8_flags.verify_predictable) {
+  if (options.trace_enabled && !i::v8_flags.predictable) {
     tracing = std::make_unique<platform::tracing::TracingController>();
 
     if (!options.enable_etw_stack_walking) {
@@ -8113,16 +8181,18 @@ int Shell::Main(int argc, char* argv[]) {
 
   int result = 0;
   Isolate::CreateParams create_params = GetDefaultIsolateCreateParams();
-  ShellArrayBufferAllocator shell_array_buffer_allocator;
-  MockArrayBufferAllocator mock_arraybuffer_allocator;
+  std::unique_ptr<v8::ArrayBuffer::Allocator> default_allocator(
+      v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+  MockArrayBufferAllocator mock_arraybuffer_allocator(default_allocator.get());
   const size_t memory_limit =
       options.mock_arraybuffer_allocator_limit * options.num_isolates;
-  MockArrayBufferAllocatiorWithLimit mock_arraybuffer_allocator_with_limit(
+  MockArrayBufferAllocatorWithLimit mock_arraybuffer_allocator_with_limit(
+      default_allocator.get(),
       memory_limit >= options.mock_arraybuffer_allocator_limit
           ? memory_limit
           : std::numeric_limits<size_t>::max());
 #ifdef V8_OS_LINUX
-  MultiMappedAllocator multi_mapped_mock_allocator;
+  MultiMappedAllocator multi_mapped_mock_allocator(default_allocator.get());
 #endif  // V8_OS_LINUX
   if (options.mock_arraybuffer_allocator) {
     if (memory_limit) {
@@ -8135,7 +8205,7 @@ int Shell::Main(int argc, char* argv[]) {
     Shell::array_buffer_allocator = &multi_mapped_mock_allocator;
 #endif  // V8_OS_LINUX
   } else {
-    Shell::array_buffer_allocator = &shell_array_buffer_allocator;
+    Shell::array_buffer_allocator = default_allocator.get();
   }
   create_params.array_buffer_allocator = Shell::array_buffer_allocator;
 #ifdef ENABLE_VTUNE_JIT_INTERFACE
@@ -8233,6 +8303,10 @@ int Shell::Main(int argc, char* argv[]) {
     // Fuzzilli REPRL = read-eval-print-loop
     do {
 #ifdef V8_FUZZILLI
+      v8::internal::Isolate* internal_isolate =
+          reinterpret_cast<v8::internal::Isolate*>(isolate);
+      internal_isolate->descriptor_lookup_cache()->Clear();
+      internal_isolate->compilation_cache()->Clear();
       if (fuzzilli_reprl) {
         unsigned action = 0;
         ssize_t nread = read(REPRL_CRFD, &action, 4);
@@ -8403,12 +8477,14 @@ int Shell::Main(int argc, char* argv[]) {
                  << bitmap.size() << std::endl;
           iteration_counter++;
         }
-        uint8_t* shmem_edges = cov_get_shmem_edges();
+        // This is run once per REPRL loop. In case of crash the coverage of
+        // crash will not be stored in shared memory. Therefore, it would be
+        // useful, if we could store these coverage information into shared
+        // memory in real time.
         if (options.fuzzilli_enable_builtins_coverage &&
-            cov_has_builtins_edges() && shmem_edges != nullptr) {
-          i::BasicBlockProfiler::Get()->UpdateBuiltinsCoverageAndReset(
-              reinterpret_cast<i::Isolate*>(isolate), cov_get_builtins_start(),
-              shmem_edges);
+            cov_has_builtins_edges()) {
+          i::BasicBlockProfiler::Get()->ForEachExecutedBlockAndReset(
+              reinterpret_cast<i::Isolate*>(isolate), cov_set_builtin_edge);
         }
         // In REPRL mode, stdout and stderr can be regular files, so they need
         // to be flushed after every execution

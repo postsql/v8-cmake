@@ -84,6 +84,10 @@
                             "inline the Smi fast path of embedded feedback "   \
                             "operations into JS baseline code")                \
                                                                                \
+  /* V8 side owner: leszeks */                                                 \
+  INTERNAL_FEATURE(always_specialize_for_script_context,                       \
+                   "always specialize for script contexts in optimized code")  \
+                                                                               \
   /* Instruction Tracing tool convention (early prototype, might change) */    \
   /* Tool convention: https://github.com/WebAssembly/tool-conventions */       \
   /* V8 side owner: jabraham */                                                \
@@ -141,21 +145,11 @@
   /* V8 side owner: jkummerow */                                               \
   WASM_FEATURE(imported_strings_utf8, "imported strings (utf8 features)")      \
                                                                                \
-  /* Wide Arithmetic proposal */                                               \
-  /* https://github.com/WebAssembly/wide-arithmetic */                         \
-  /* V8 side owner: ryandiaz */                                                \
-  WASM_FEATURE(wide_arithmetic, "wide arithmetic")                             \
-                                                                               \
   /* Acquire-Release memory ordering from Shared-Everything Threads */         \
   /* proposal. */                                                              \
   /* Part of https://github.com/WebAssembly/shared-everything-threads */       \
   /* V8 side owner: rezvan */                                                  \
-  WASM_FEATURE(acquire_release, "acquire_release memory ordering")             \
-                                                                               \
-  /* Wasm Re-vectorization (no proposal, engine optimization only). */         \
-  /* V8 side owner: jkummerow */                                               \
-  IF_REVEC_ENABLED(INTERNAL_FEATURE, wasm_revectorize,                         \
-                   "128 to 256 bit SIMD re-vectorization for Wasm")
+  WASM_FEATURE(acquire_release, "acquire_release memory ordering")
 
 // #############################################################################
 // Staged features (disabled by default, but enabled via --js-staging/--harmony,
@@ -175,8 +169,6 @@
                                                                                \
   JS_FEATURE(js_immutable_arraybuffer, "Immutable ArrayBuffer")                \
                                                                                \
-  JS_FEATURE(js_import_text, "import text")                                    \
-                                                                               \
   JS_FEATURE(js_import_bytes, "import bytes")                                  \
                                                                                \
   JS_FEATURE(js_defer_import_eval, "defer import eval")                        \
@@ -187,7 +179,19 @@
   /* --wasm-js-interop for now. */                                             \
   /* V8 side owner: jkummerow */                                               \
   /* Staged (without JS Interop) in v14.8 */                                   \
-  WASM_FEATURE(custom_descriptors, "custom descriptors")
+  WASM_FEATURE(custom_descriptors, "custom descriptors")                       \
+                                                                               \
+  /* Wasm Re-vectorization (no proposal, engine optimization only). */         \
+  /* V8 side owner: jkummerow */                                               \
+  /* Staged in 15.4 */                                                         \
+  IF_REVEC_ENABLED(INTERNAL_FEATURE, wasm_revectorize,                         \
+                   "128 to 256 bit SIMD re-vectorization for Wasm")            \
+                                                                               \
+  /* Wide Arithmetic proposal */                                               \
+  /* https://github.com/WebAssembly/wide-arithmetic */                         \
+  /* V8 side owner: ryandiaz */                                                \
+  /* Staged in 15.7 */                                                         \
+  WASM_FEATURE(wide_arithmetic, "wide arithmetic")
 
 // #############################################################################
 // Shipped features (enabled by default).
@@ -218,6 +222,8 @@
                                                                                \
   JS_FEATURE(js_iterator_includes, "Iterator.prototype.includes")              \
                                                                                \
+  JS_FEATURE(js_import_text, "import text")                                    \
+                                                                               \
   /* Legacy exception handling proposal. */                                    \
   /* https://github.com/WebAssembly/exception-handling */                      \
   /* V8 side owner: thibaudm */                                                \
@@ -226,6 +232,10 @@
   WASM_FEATURE(legacy_eh, "legacy exception handling opcodes")                 \
                                                                                \
   IF_SPARKPLUG_PLUS_ENABLED(INTERNAL_FEATURE, sparkplug_plus,                  \
-                            "dynamic patching on JS baseline code")
+                            "dynamic patching on JS baseline code")            \
+                                                                               \
+  INTERNAL_FEATURE(homomorphic_ic,                                             \
+                   "Homomorphic IC state for same-handler highly polymorphic " \
+                   "ICs")
 
 #endif  // V8_FLAGS_FEATURE_FLAGS_H_

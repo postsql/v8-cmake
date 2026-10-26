@@ -147,7 +147,7 @@ Maybe<bool> InsertOptionsIntoLocale(Isolate* isolate,
 DirectHandle<Object> UnicodeKeywordValue(Isolate* isolate,
                                          DirectHandle<JSLocale> locale,
                                          const char* key) {
-  CppGCManaged<icu::Locale>::Ptr icu_locale = locale->icu_locale()->ptr();
+  Managed<icu::Locale>::Ptr icu_locale = locale->icu_locale()->ptr();
   UErrorCode status = U_ZERO_ERROR;
   std::string value =
       icu_locale->getUnicodeKeywordValue<std::string>(key, status);
@@ -287,28 +287,30 @@ bool JSLocale::StartsWithUnicodeLanguageId(std::string_view value) {
 }
 
 namespace {
-// Return true if variants contain duplicate elements.
-bool DuplicateVariants(std::string variants) {
+// Return false if variants contain duplicate elements or invalid delimiters.
+bool IsValidVariants(std::string_view variants) {
   // The length of one unicode_variant_subtag is between 4-8. To have
-  // duplicate, the length of the variants need to be >= 4+1+4 = 9.
+  // duplicate or multiple subtags, the length of the variants need to be >=
+  // 4+1+4 = 9.
   if (variants.length() >= 9) {
-    std::transform(
-        variants.begin(), variants.end(), variants.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    size_t pos = 0;
-    size_t count = 1;
     std::set<std::string> set;
-    while ((pos = variants.find('-')) != std::string::npos) {
-      set.insert(variants.substr(0, pos));
-      variants.erase(0, pos + 1);
-      count++;
-    }
-    set.insert(variants);
-    if (count != set.size()) {
-      return true;
+    size_t start = 0;
+    for (size_t i = 0; i <= variants.length(); ++i) {
+      if (i == variants.length() || variants[i] == '-') {
+        std::string subtag(variants.substr(start, i - start));
+        std::transform(
+            subtag.begin(), subtag.end(), subtag.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (!set.insert(subtag).second) {
+          return false;
+        }
+        start = i + 1;
+      } else if (variants[i] == '_') {
+        return false;
+      }
     }
   }
-  return false;
+  return true;
 }
 Maybe<bool> ApplyOptionsToTag(Isolate* isolate, DirectHandle<String> tag,
                               DirectHandle<JSReceiver> options,
@@ -416,7 +418,7 @@ Maybe<bool> ApplyOptionsToTag(Isolate* isolate, DirectHandle<String> tag,
     }
     // e. If variantSubtags contains any duplicate elements, throw a
     // RangeError exception.
-    if (DuplicateVariants(variants_stdstr)) {
+    if (!IsValidVariants(variants_stdstr)) {
       return Just(false);
     }
   }
@@ -475,8 +477,8 @@ MaybeDirectHandle<JSLocale> JSLocale::New(Isolate* isolate,
   }
 
   // 31. Set locale.[[Locale]] to r.[[locale]].
-  DirectHandle<CppGCManaged<icu::Locale>> managed_locale =
-      CppGCManaged<icu::Locale>::Create(
+  DirectHandle<Managed<icu::Locale>> managed_locale =
+      Managed<icu::Locale>::From(
           isolate, 0, std::shared_ptr<icu::Locale>{icu_locale.clone()});
 
   // Now all properties are ready, so we can allocate the result object.
@@ -491,8 +493,8 @@ namespace {
 
 MaybeDirectHandle<JSLocale> Construct(Isolate* isolate,
                                       const icu::Locale& icu_locale) {
-  DirectHandle<CppGCManaged<icu::Locale>> managed_locale =
-      CppGCManaged<icu::Locale>::Create(
+  DirectHandle<Managed<icu::Locale>> managed_locale =
+      Managed<icu::Locale>::From(
           isolate, 0, std::shared_ptr<icu::Locale>{icu_locale.clone()});
 
   DirectHandle<JSFunction> constructor(
@@ -972,7 +974,7 @@ MaybeDirectHandle<JSObject> JSLocale::GetWeekInfo(
 DirectHandle<Object> JSLocale::Language(Isolate* isolate,
                                         DirectHandle<JSLocale> locale) {
   Factory* factory = isolate->factory();
-  CppGCManaged<icu::Locale>::Ptr icu_locale = locale->icu_locale()->ptr();
+  Managed<icu::Locale>::Ptr icu_locale = locale->icu_locale()->ptr();
   const char* language = icu_locale->getLanguage();
   constexpr const char kUnd[] = "und";
   if (strlen(language) == 0) {
@@ -984,7 +986,7 @@ DirectHandle<Object> JSLocale::Language(Isolate* isolate,
 DirectHandle<Object> JSLocale::Script(Isolate* isolate,
                                       DirectHandle<JSLocale> locale) {
   Factory* factory = isolate->factory();
-  CppGCManaged<icu::Locale>::Ptr icu_locale = locale->icu_locale()->ptr();
+  Managed<icu::Locale>::Ptr icu_locale = locale->icu_locale()->ptr();
   const char* script = icu_locale->getScript();
   if (strlen(script) == 0) return factory->undefined_value();
   return factory->NewStringFromAsciiChecked(script);
@@ -1009,7 +1011,7 @@ DirectHandle<Object> JSLocale::Variants(Isolate* isolate,
 DirectHandle<Object> JSLocale::Region(Isolate* isolate,
                                       DirectHandle<JSLocale> locale) {
   Factory* factory = isolate->factory();
-  CppGCManaged<icu::Locale>::Ptr icu_locale = locale->icu_locale()->ptr();
+  Managed<icu::Locale>::Ptr icu_locale = locale->icu_locale()->ptr();
   const char* region = icu_locale->getCountry();
   if (strlen(region) == 0) return factory->undefined_value();
   return factory->NewStringFromAsciiChecked(region);
@@ -1050,7 +1052,7 @@ DirectHandle<Object> JSLocale::HourCycle(Isolate* isolate,
 DirectHandle<Object> JSLocale::Numeric(Isolate* isolate,
                                        DirectHandle<JSLocale> locale) {
   Factory* factory = isolate->factory();
-  CppGCManaged<icu::Locale>::Ptr icu_locale = locale->icu_locale()->ptr();
+  Managed<icu::Locale>::Ptr icu_locale = locale->icu_locale()->ptr();
   UErrorCode status = U_ZERO_ERROR;
   std::string numeric =
       icu_locale->getUnicodeKeywordValue<std::string>("kn", status);
@@ -1063,7 +1065,7 @@ DirectHandle<Object> JSLocale::NumberingSystem(Isolate* isolate,
 }
 
 std::string JSLocale::ToString(DirectHandle<JSLocale> locale) {
-  CppGCManaged<icu::Locale>::Ptr icu_locale = locale->icu_locale()->ptr();
+  Managed<icu::Locale>::Ptr icu_locale = locale->icu_locale()->ptr();
   return Intl::ToLanguageTag(*icu_locale).FromJust();
 }
 

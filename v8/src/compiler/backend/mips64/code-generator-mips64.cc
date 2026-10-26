@@ -240,8 +240,7 @@ class OutOfLineTrap final : public OutOfLineCode {
     // Just encode the stub index. This will be patched when the code
     // is added to the native module and copied into wasm code space.
     __ Call(static_cast<Address>(trap_id), RelocInfo::WASM_STUB_CALL);
-    ReferenceMap* reference_map = gen_->zone()->New<ReferenceMap>(gen_->zone());
-    gen_->RecordSafepoint(reference_map);
+    gen_->RecordSafepointWithoutTaggedSlots();
     if (v8_flags.debug_code) {
       __ stop();
     }
@@ -1021,6 +1020,22 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       __ DaddOverflow(i.OutputRegister(), i.InputRegister(0), i.InputOperand(1),
                       kScratchReg);
       break;
+    case kMips64Add64_3: {
+      Register low = i.OutputRegister(0);
+      UseScratchRegisterScope temps(masm());
+      Register scratch = temps.Acquire();
+      __ Daddu(scratch, i.InputRegister(0), i.InputOperand(1));
+      if (instr->OutputCount() > 1) {
+        Register high = i.OutputRegister(1);
+        __ Sltu(high, scratch, i.InputRegister(0));
+        __ Daddu(low, scratch, i.InputOperand(2));
+        __ Sltu(scratch, low, scratch);
+        __ Daddu(high, high, scratch);
+      } else {
+        __ Daddu(low, scratch, i.InputOperand(2));
+      }
+      break;
+    }
     case kMips64Add128: {
       UseScratchRegisterScope temps(masm());
       Register scratch = temps.Acquire();
@@ -4339,8 +4354,7 @@ void CodeGenerator::AssembleConstructFrame() {
               RelocInfo::WASM_STUB_CALL);
       // The call does not return, hence we can ignore any references and just
       // define an empty safepoint.
-      ReferenceMap* reference_map = zone()->New<ReferenceMap>(zone());
-      RecordSafepoint(reference_map);
+      RecordSafepointWithoutTaggedSlots();
       if (v8_flags.debug_code) __ stop();
 
       __ bind(&done);

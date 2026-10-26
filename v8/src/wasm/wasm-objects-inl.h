@@ -690,20 +690,6 @@ void WasmImportData::clear_importing_instance_data() {
   protected_importing_instance_data_.store(this, {}, SKIP_WRITE_BARRIER);
 }
 
-Tagged<TrustedObject> WasmImportData::call_origin() const {
-  DCHECK(has_call_origin());
-  return protected_call_origin_.load();
-}
-void WasmImportData::set_call_origin(Tagged<TrustedObject> value,
-                                     WriteBarrierMode mode) {
-  protected_call_origin_.store(this, value, mode);
-}
-bool WasmImportData::has_call_origin() const {
-  return !protected_call_origin_.load().is_null();
-}
-void WasmImportData::clear_call_origin() {
-  protected_call_origin_.store(this, {}, SKIP_WRITE_BARRIER);
-}
 
 Tagged<NativeContext> WasmImportData::native_context() const {
   return native_context_.load();
@@ -747,13 +733,6 @@ void WasmImportData::set_suspend(wasm::Suspend value) {
   set_bit_field(SuspendField::update(bit_field(), value));
 }
 
-uint32_t WasmImportData::table_slot() const {
-  return TableSlotField::decode(bit_field());
-}
-
-void WasmImportData::set_table_slot(uint32_t value) {
-  set_bit_field(TableSlotField::update(bit_field(), value));
-}
 
 void WasmImportData::clear_padding() {
 #if TAGGED_SIZE_8_BYTES
@@ -838,14 +817,6 @@ bool WasmFuncRef::has_internal() const { return !trusted_internal_.is_empty(); }
 void WasmFuncRef::clear_internal() { trusted_internal_.clear(this); }
 
 // WasmFunctionData
-Tagged<Code> WasmFunctionData::wrapper_code(IsolateForSandbox isolate) const {
-  return wrapper_code_.load(isolate);
-}
-void WasmFunctionData::set_wrapper_code(Tagged<Code> value,
-                                        WriteBarrierMode mode) {
-  wrapper_code_.store(this, value, mode);
-}
-
 Tagged<WasmInternalFunction> WasmFunctionData::internal() const {
   DCHECK(has_internal());
   return protected_internal_.load();
@@ -1319,6 +1290,10 @@ void WasmStruct::EncodeInstanceSizeInMap(int instance_size, Tagged<Map> map) {
   static_assert(0xFFFF > ((kHeaderSize + wasm::kMaxValueTypeSize *
                                              wasm::kV8MaxWasmStructFields) >>
                           kObjectAlignmentBits));
+  static_assert(0xFFFF >
+                ((WasmCustomMap::kHeaderSize +
+                  wasm::kMaxValueTypeSize * wasm::kV8MaxWasmStructFields) >>
+                 kObjectAlignmentBits));
   map->SetWasmByte1((instance_size >> kObjectAlignmentBits) & 0xff);
   map->SetWasmByte2(instance_size >> (8 + kObjectAlignmentBits));
 }
@@ -1333,11 +1308,18 @@ int WasmStruct::GcSafeSize(Tagged<Map> map) {
   return DecodeInstanceSizeFromMap(map);
 }
 
+int WasmStruct::FieldOffset(const wasm::StructType* type, int field_index) {
+  int header_size = type->is_descriptor() ? WasmCustomMap::kHeaderSize
+                                          : WasmStruct::kHeaderSize;
+  return header_size + type->field_offset(field_index);
+}
+
 Address WasmStruct::RawFieldAddress(int raw_offset) {
   int offset = WasmStruct::kHeaderSize + raw_offset;
   return FIELD_ADDR(Tagged<WasmStruct>(this), offset);
 }
 
+// TODO(jkummerow): Stop shadowing {HeapObject::RawField} maybe?
 ObjectSlot WasmStruct::RawField(int raw_offset) {
   return ObjectSlot(RawFieldAddress(raw_offset));
 }
@@ -1360,6 +1342,41 @@ void WasmStruct::set_described_rtt(Tagged<Map> value, WriteBarrierMode mode) {
   DCHECK(GcSafeType(map())->is_descriptor());
   TaggedField<Map, kHeaderSize>::store(Tagged<WasmStruct>(this), value);
   CONDITIONAL_WRITE_BARRIER(Tagged<HeapObject>(this), kHeaderSize, value, mode);
+}
+
+Address WasmCustomMap::RawFieldAddress(int raw_offset) {
+  int offset = WasmCustomMap::kHeaderSize + raw_offset;
+  return FIELD_ADDR(Tagged<WasmCustomMap>(this), offset);
+}
+
+// TODO(jkummerow): Stop shadowing {HeapObject::RawField} maybe?
+ObjectSlot WasmCustomMap::RawField(int raw_offset) {
+  return ObjectSlot(RawFieldAddress(raw_offset));
+}
+
+Tagged<Union<WasmCustomMapWrapper, Null>> WasmCustomMap::js_wrapper() const {
+  return js_wrapper_.load();
+}
+void WasmCustomMap::set_js_wrapper(
+    Tagged<Union<WasmCustomMapWrapper, Null>> wrapper, WriteBarrierMode mode) {
+  js_wrapper_.store(this, wrapper, mode);
+}
+
+Tagged<NativeContext> WasmCustomMap::native_context_for_wrapper() const {
+  return native_context_for_wrapper_.load();
+}
+void WasmCustomMap::set_native_context_for_wrapper(
+    Tagged<NativeContext> context, WriteBarrierMode mode) {
+  native_context_for_wrapper_.store(this, context, mode);
+}
+
+Tagged<WasmCustomMap> WasmCustomMapWrapper::wrapped() const {
+  return wrapped_.load();
+}
+
+void WasmCustomMapWrapper::set_wrapped(Tagged<WasmCustomMap> custom_map,
+                                       WriteBarrierMode mode) {
+  wrapped_.store(this, custom_map, mode);
 }
 
 uint32_t WasmArray::length() const { return length_; }

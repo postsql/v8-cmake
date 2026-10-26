@@ -30,16 +30,9 @@ namespace internal {
 using Closure = std::function<void()>;
 
 template <typename T>
-T* GetRaw(const std::unique_ptr<T>& ptr) {
-  return ptr.get();
-}
-
-#ifdef V8_CPPGC_MICROTASK_QUEUE
-template <typename T>
 T* GetRaw(const cppgc::Persistent<T>& ptr) {
   return ptr.Get();
 }
-#endif  // V8_CPPGC_MICROTASK_QUEUE
 
 void RunStdFunction(void* data) {
   std::unique_ptr<Closure> f(static_cast<Closure*>(data));
@@ -174,11 +167,7 @@ class MicrotaskQueueTest
   }
 
  private:
-#ifdef V8_CPPGC_MICROTASK_QUEUE
   cppgc::Persistent<MicrotaskQueue> microtask_queue_;
-#else
-  std::unique_ptr<MicrotaskQueue> microtask_queue_;
-#endif  // V8_CPPGC_MICROTASK_QUEUE
 };
 
 class RecordingVisitor : public RootVisitor {
@@ -216,6 +205,30 @@ TEST_P(MicrotaskQueueTest, EnqueueAndRun) {
   EXPECT_EQ(0, microtask_queue()->size());
 }
 
+// The public v8::MicrotaskQueue policy accessors control auto-running for
+// this queue, independently of Isolate::SetMicrotasksPolicy().
+TEST_P(MicrotaskQueueTest, SetMicrotasksPolicy) {
+  v8::MicrotaskQueue* api_queue = microtask_queue();
+  api_queue->SetMicrotasksPolicy(MicrotasksPolicy::kExplicit);
+  EXPECT_EQ(MicrotasksPolicy::kExplicit, api_queue->GetMicrotasksPolicy());
+  EXPECT_EQ(MicrotasksPolicy::kExplicit,
+            microtask_queue()->microtasks_policy());
+
+  bool ran = false;
+  Enqueue([&ran] { ran = true; });
+  // With kExplicit, completing a script run does not drain this queue.
+  RunJS("0");
+  EXPECT_FALSE(ran);
+  EXPECT_EQ(1, microtask_queue()->size());
+
+  // With kAuto it does.
+  api_queue->SetMicrotasksPolicy(MicrotasksPolicy::kAuto);
+  EXPECT_EQ(MicrotasksPolicy::kAuto, api_queue->GetMicrotasksPolicy());
+  RunJS("0");
+  EXPECT_TRUE(ran);
+  EXPECT_EQ(0, microtask_queue()->size());
+}
+
 // Check for a buffer growth.
 TEST_P(MicrotaskQueueTest, BufferGrowth) {
   int count = 0;
@@ -246,38 +259,6 @@ TEST_P(MicrotaskQueueTest, BufferGrowth) {
             microtask_queue()->RunMicrotasks(isolate()));
   EXPECT_EQ(MicrotaskQueue::kMinimumCapacity + 2, count);
 }
-
-#ifndef V8_CPPGC_MICROTASK_QUEUE
-// MicrotaskQueue instances form a doubly linked list.
-TEST_P(MicrotaskQueueTest, InstanceChain) {
-  ClearTestMicrotaskQueue();
-
-  MicrotaskQueue* default_mtq = isolate()->default_microtask_queue();
-  ASSERT_TRUE(default_mtq);
-  EXPECT_EQ(default_mtq, default_mtq->next());
-  EXPECT_EQ(default_mtq, default_mtq->prev());
-
-  // Create two instances, and check their connection.
-  // The list contains all instances in the creation order, and the next of the
-  // last instance is the first instance:
-  //   default_mtq -> mtq1 -> mtq2 -> default_mtq.
-  std::unique_ptr<MicrotaskQueue> mtq1 = MicrotaskQueue::New(isolate());
-  std::unique_ptr<MicrotaskQueue> mtq2 = MicrotaskQueue::New(isolate());
-  EXPECT_EQ(default_mtq->next(), mtq1.get());
-  EXPECT_EQ(mtq1->next(), mtq2.get());
-  EXPECT_EQ(mtq2->next(), default_mtq);
-  EXPECT_EQ(default_mtq, mtq1->prev());
-  EXPECT_EQ(mtq1.get(), mtq2->prev());
-  EXPECT_EQ(mtq2.get(), default_mtq->prev());
-
-  // Deleted item should be also removed from the list.
-  mtq1 = nullptr;
-  EXPECT_EQ(default_mtq->next(), mtq2.get());
-  EXPECT_EQ(mtq2->next(), default_mtq);
-  EXPECT_EQ(default_mtq, mtq2->prev());
-  EXPECT_EQ(mtq2.get(), default_mtq->prev());
-}
-#endif  // V8_CPPGC_MICROTASK_QUEUE
 
 // Pending Microtasks in MicrotaskQueues are strong roots. Ensure they are
 // visited exactly once.
@@ -491,13 +472,8 @@ TEST_P(MicrotaskQueueTest, DetachGlobal_ResolveThenableForeignThen) {
 
   {
     // Create a context with its own microtask queue.
-#ifdef V8_CPPGC_MICROTASK_QUEUE
     cppgc::Persistent<MicrotaskQueue> sub_microtask_queue =
         MicrotaskQueue::New(isolate());
-#else
-    std::unique_ptr<MicrotaskQueue> sub_microtask_queue =
-        MicrotaskQueue::New(isolate());
-#endif  // V8_CPPGC_MICROTASK_QUEUE
 
     sub_microtask_queue->set_microtasks_policy(MicrotasksPolicy::kExplicit);
     Local<v8::Context> sub_context = v8::Context::New(
@@ -558,13 +534,8 @@ TEST_P(MicrotaskQueueTest, DetachGlobal_ResolveThenableNativeThen) {
 
   {
     // Create a context with its own microtask queue.
-#ifdef V8_CPPGC_MICROTASK_QUEUE
     cppgc::Persistent<MicrotaskQueue> sub_microtask_queue =
         MicrotaskQueue::New(isolate());
-#else
-    std::unique_ptr<MicrotaskQueue> sub_microtask_queue =
-        MicrotaskQueue::New(isolate());
-#endif
     sub_microtask_queue->set_microtasks_policy(MicrotasksPolicy::kExplicit);
     Local<v8::Context> sub_context = v8::Context::New(
         v8_isolate(),

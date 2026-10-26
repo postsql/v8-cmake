@@ -206,6 +206,14 @@ inline ReduceResult MaybeReduceResult::Checked() { return ReduceResult(*this); }
     }                                       \
   } while (false)
 
+#define RETURN_IF_NOT_DONE_WITHOUT_ABORT(result) \
+  do {                                           \
+    auto res = (result);                         \
+    if (!res.IsDoneWithoutAbort()) {             \
+      return res;                                \
+    }                                            \
+  } while (false)
+
 #define PROCESS_AND_RETURN_IF_DONE(result, value_processor) \
   do {                                                      \
     auto res = (result);                                    \
@@ -296,9 +304,13 @@ concept ReducerBaseWithKNASetter = requires(BaseT* b, KnownNodeAspects* kna) {
   b->set_known_node_aspects(kna);
 };
 
+// Bases that can emit eager deopting nodes provide both an eager deopt frame
+// and a predicate telling whether one is available at the current position.
 template <typename BaseT>
-concept ReducerBaseWithEagerDeopt =
-    requires(BaseT* b) { b->GetDeoptFrameForEagerDeopt(); };
+concept ReducerBaseWithEagerDeopt = requires(BaseT* b) {
+  b->GetDeoptFrameForEagerDeopt();
+  b->CanEagerDeopt();
+};
 
 template <typename BaseT>
 concept ReducerBaseWithAbruptBlockEnd =
@@ -692,8 +704,7 @@ class MaglevReducer {
     LazyDeoptFrameScope(MaglevReducer* reducer, ValueNode* context,
                         Builtin continuation,
                         compiler::OptionalJSFunctionRef maybe_js_target = {},
-                        base::Vector<ValueNode* const> parameters = {},
-                        bool is_with_catch = false);
+                        base::Vector<ValueNode* const> parameters = {});
     LazyDeoptFrameScope(MaglevReducer* reducer, ValueNode* context,
                         ValueNode* receiver, const MaglevCompilationUnit& unit,
                         SourcePosition position);
@@ -701,11 +712,6 @@ class MaglevReducer {
 
     LazyDeoptFrameScope* parent() const { return parent_; }
     const DeoptFrame::FrameData& data() const { return data_; }
-    bool is_with_catch() const {
-      return data_.tag() == DeoptFrame::FrameType::kBuiltinContinuationFrame &&
-             data_.get<DeoptFrame::BuiltinContinuationFrameData>()
-                 .is_with_catch;
-    }
 
    private:
     MaglevReducer* reducer_;
@@ -742,6 +748,20 @@ class MaglevReducer {
 
   EagerDeoptFrameScope* current_eager_deopt_scope() const {
     return current_eager_deopt_scope_;
+  }
+
+  // Whether an eager deopt frame is available at the current position, ie,
+  // whether a reduction is allowed to emit nodes that can eager deopt. This is
+  // always the case while building the graph, but not while optimizing it: a
+  // node that only has lazy deopt info has no eager deopt frame to clone, and
+  // its lazy deopt frame cannot be used instead, since that one describes the
+  // state *after* the bytecode rather than the state needed to re-execute it.
+  bool CanEagerDeopt() const {
+    if constexpr (ReducerBaseWithEagerDeopt<BaseT>) {
+      return base_->CanEagerDeopt();
+    } else {
+      return false;
+    }
   }
 
   MaglevReducer(BaseT* base, Graph* graph,
@@ -870,13 +890,16 @@ class MaglevReducer {
       ValueNode* receiver, compiler::HeapObjectRef prototype);
   MaybeReduceResult TryBuildFastHasInPrototypeChain(
       ValueNode* object, compiler::HeapObjectRef prototype);
+  // Bound functions are unwrapped recursively; cap how deep we follow the
+  // bound_target_function chain to bound both graph size and stack usage.
+  static constexpr int kMaxBoundFunctionDepth = 5;
   MaybeReduceResult TryBuildFastOrdinaryHasInstance(
       ValueNode* context, ValueNode* object, compiler::JSObjectRef callable,
-      ValueNode* callable_node_if_not_constant);
-  MaybeReduceResult TryBuildFastInstanceOf(ValueNode* context,
-                                           ValueNode* object,
-                                           compiler::JSObjectRef callable_ref,
-                                           ValueNode* callable_node);
+      ValueNode* callable_node_if_not_constant,
+      int max_depth = kMaxBoundFunctionDepth);
+  MaybeReduceResult TryBuildFastInstanceOf(
+      ValueNode* context, ValueNode* object, compiler::JSObjectRef callable_ref,
+      ValueNode* callable_node, int max_depth = kMaxBoundFunctionDepth);
   MaybeReduceResult TryBuildFastInstanceOfWithFeedback(
       ValueNode* context, ValueNode* object, ValueNode* callable,
       compiler::FeedbackSource feedback_source);
@@ -909,7 +932,8 @@ class MaglevReducer {
 
   ReduceResult BuildOrdinaryHasInstance(
       ValueNode* context, ValueNode* object, compiler::JSObjectRef callable,
-      ValueNode* callable_node_if_not_constant);
+      ValueNode* callable_node_if_not_constant,
+      int max_depth = kMaxBoundFunctionDepth);
 
   template <bool flip = false>
   ReduceResult BuildToBoolean(ValueNode* value);
@@ -959,8 +983,7 @@ class MaglevReducer {
       compiler::FeedbackSource const& feedback_source);
 
 #if V8_ENABLE_WEBASSEMBLY
-  bool ShouldWrapArgsForWasmInlining(compiler::SharedFunctionInfoRef shared,
-                                     JSDispatchHandle dispatch_handle);
+  bool ShouldWrapArgsForWasmInlining(JSDispatchHandle dispatch_handle);
 #endif  // V8_ENABLE_WEBASSEMBLY
 
   compiler::OptionalStringRef GetStringFromInt32(int32_t value);
@@ -1057,6 +1080,9 @@ class MaglevReducer {
   ReduceResult BuildAndAllocateJSArrayIterator(ValueNode* array,
                                                IterationKind iteration_kind);
   void ClearCurrentAllocationBlock();
+  void SetCurrentAllocationBlock(AllocationBlock* block) {
+    current_allocation_block_ = block;
+  }
   void AddNonEscapingUses(InlinedAllocation* allocation, int use_count);
   AllocationBlock* current_allocation_block() const {
     return current_allocation_block_;
@@ -1204,14 +1230,22 @@ class MaglevReducer {
   V(ArrayPrototypeEntries)                     \
   V(ArrayPrototypeKeys)                        \
   V(ArrayPrototypeValues)                      \
+  V(DataViewPrototypeGetFloat32)               \
   V(DataViewPrototypeGetFloat64)               \
   V(DataViewPrototypeGetInt16)                 \
   V(DataViewPrototypeGetInt32)                 \
   V(DataViewPrototypeGetInt8)                  \
+  V(DataViewPrototypeGetUint16)                \
+  V(DataViewPrototypeGetUint32)                \
+  V(DataViewPrototypeGetUint8)                 \
+  V(DataViewPrototypeSetFloat32)               \
   V(DataViewPrototypeSetFloat64)               \
   V(DataViewPrototypeSetInt16)                 \
   V(DataViewPrototypeSetInt32)                 \
   V(DataViewPrototypeSetInt8)                  \
+  V(DataViewPrototypeSetUint16)                \
+  V(DataViewPrototypeSetUint32)                \
+  V(DataViewPrototypeSetUint8)                 \
   V(DatePrototypeGetDate)                      \
   V(DatePrototypeGetDay)                       \
   V(DatePrototypeGetFullYear)                  \
@@ -1335,6 +1369,10 @@ class MaglevReducer {
   MaybeReduceResult TryReduceStringPrototypeIndexOfIncludes(CallArguments& args,
                                                             bool is_includes);
 
+  MaybeReduceResult BuildSpeculativeCheckInstanceType(ValueNode* object,
+                                                      NodeType target_type,
+                                                      InstanceType first,
+                                                      InstanceType last);
   ReduceResult BuildCheckInstanceType(ValueNode* object, NodeType target_type,
                                       InstanceType first, InstanceType last);
   ReduceResult GetInt32ElementIndex(ValueNode* index_object);
@@ -1527,7 +1565,7 @@ class MaglevReducer {
 
   ValueNode* GetNumberConstant(double constant);
 
-  bool IsTheHoleConstant(ValueNode* node);
+  bool IsTdzHoleConstant(ValueNode* node);
   ReduceResult GetConvertReceiver(compiler::SharedFunctionInfoRef shared,
                                   ValueNode* receiver,
                                   ConvertReceiverMode mode);

@@ -1236,7 +1236,10 @@ class CallSiteBuilder {
                    DirectHandle<UnionOf<Smi, JSFunction>> function,
                    DirectHandle<Union<Code, BytecodeArray, Undefined>> code_obj,
                    int offset, int flags) {
-    if (IsTheHole(*receiver_or_instance)) {
+#ifdef V8_ENABLE_TDZ_HOLE
+    DCHECK(!IsTheHole(*receiver_or_instance));
+#endif
+    if (IsTdzHole(*receiver_or_instance)) {
       // TODO(jgruber): Fix all cases in which frames give us a hole value
       // (e.g. the receiver in RegExp constructor frames).
       receiver_or_instance = isolate_->factory()->undefined_value();
@@ -1799,12 +1802,15 @@ MaybeDirectHandle<JSObject> Isolate::CaptureAndSetErrorStack(
           static_cast<uint32_t>(
               stack_trace_for_uncaught_exceptions_frame_limit_));
       DCHECK_GE(stack_trace_limit, 0);
-      if (static_cast<uint32_t>(stack_trace_limit) *
-              CallSiteInfo::Fields::kCount <
-          raw_data_for_call_site_infos->ulength().value()) {
+      // Compare in frames rather than raw slots to avoid overflowing for
+      // large Error.stackTraceLimit values.
+      uint32_t frame_count = raw_data_for_call_site_infos->ulength().value() /
+                             CallSiteInfo::Fields::kCount;
+      if (static_cast<uint32_t>(stack_trace_limit) < frame_count) {
         call_site_infos_or_formatted_stack = FixedArray::RightTrimOrEmpty(
             this, raw_data_for_call_site_infos,
-            stack_trace_limit * CallSiteInfo::Fields::kCount);
+            static_cast<uint32_t>(stack_trace_limit) *
+                CallSiteInfo::Fields::kCount);
       }
       // Notify the debugger.
       OnStackTraceCaptured(stack_trace);
@@ -5065,7 +5071,6 @@ void Isolate::PrintAndClearRegExpSubjectStrings() {
 }
 #endif  // V8_ENABLE_REGEXP_DIAGNOSTICS
 
-#ifdef V8_CPPGC_MICROTASK_QUEUE
 void Isolate::CompactMicrotaskQueues() {
   microtask_queues_.erase(
       std::remove_if(microtask_queues_.begin(), microtask_queues_.end(),
@@ -5076,7 +5081,6 @@ void Isolate::RegisterMicrotaskQueue(MicrotaskQueue* queue) {
   CompactMicrotaskQueues();
   microtask_queues_.push_back(queue);
 }
-#endif  // V8_CPPGC_MICROTASK_QUEUE
 
 void Isolate::Deinit() {
   TRACE_ISOLATE(deinit);
@@ -5456,20 +5460,12 @@ Isolate::~Isolate() {
 
   DCHECK_NULL(builtins_effects_analyzer_);
 
-#ifdef V8_CPPGC_MICROTASK_QUEUE
   // Assert that |default_microtask_queue_| is the last MicrotaskQueue instance.
   CompactMicrotaskQueues();
   if (DEBUG_BOOL && default_microtask_queue_) {
     DCHECK_EQ(microtask_queues_.size(), 1);
   }
   default_microtask_queue_ = nullptr;
-#else
-  // Assert that |default_microtask_queue_| is the last MicrotaskQueue instance.
-  DCHECK_IMPLIES(default_microtask_queue_,
-                 default_microtask_queue_ == default_microtask_queue_->next());
-  delete default_microtask_queue_;
-  default_microtask_queue_ = nullptr;
-#endif  // V8_CPPGC_MICROTASK_QUEUE
 
   // isolate_group_ released in caller, to ensure that all member destructors
   // run before potentially unmapping the isolate's VirtualMemoryArea.
@@ -6893,6 +6889,17 @@ void Isolate::AbortConcurrentOptimization(BlockingBehavior behavior) {
 #endif
 }
 
+void Isolate::WaitForConcurrentOptimizationJobs() {
+  if (concurrent_recompilation_enabled()) {
+    optimizing_compile_dispatcher()->WaitUntilCompilationJobsDone();
+  }
+#ifdef V8_ENABLE_MAGLEV
+  if (maglev_concurrent_dispatcher()->is_enabled()) {
+    maglev_concurrent_dispatcher()->AwaitCompileJobs();
+  }
+#endif  // V8_ENABLE_MAGLEV
+}
+
 std::shared_ptr<CompilationStatistics> Isolate::GetTurboStatistics() {
   if (turbo_statistics_ == nullptr) {
     turbo_statistics_.reset(new CompilationStatistics());
@@ -7686,8 +7693,7 @@ bool Isolate::HasCrashKeyStringCallbacks() {
   return static_cast<bool>(allocate_crash_key_string_callback_);
 }
 
-CrashKey Isolate::AddCrashKeyString(const char key[], CrashKeySize size,
-                                    std::string_view value) {
+CrashKey Isolate::AllocateCrashKeyString(const char key[], CrashKeySize size) {
   CHECK(HasCrashKeyStringCallbacks());
 #if DEBUG
   // Keys are limited in their length, see
@@ -7696,8 +7702,13 @@ CrashKey Isolate::AddCrashKeyString(const char key[], CrashKeySize size,
   static constexpr size_t kCrashKeyStorageKeySize = 40;
   DCHECK_LT(strlen(key), kCrashKeyStorageKeySize);
 #endif  // DEBUG
-  CrashKey crash_key = allocate_crash_key_string_callback_(key, size);
-  set_crash_key_string_callback_(crash_key, value);
+  return allocate_crash_key_string_callback_(key, size);
+}
+
+CrashKey Isolate::AddCrashKeyString(const char key[], CrashKeySize size,
+                                    std::string_view value) {
+  CrashKey crash_key = AllocateCrashKeyString(key, size);
+  SetCrashKeyString(crash_key, value);
   return crash_key;
 }
 

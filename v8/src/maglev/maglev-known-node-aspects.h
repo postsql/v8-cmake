@@ -24,6 +24,8 @@ class KnownNodeAspects;
 class TraceLogger;
 
 enum class EnsureTypeResult { kAlreadyHadType, kTypeUpdated, kContradiction };
+using UpdateTypeOnContradiction =
+    base::StrongAlias<struct UpdateTypeOnContradictionTag, bool>;
 
 using PossibleMaps = compiler::ZoneRefSet<Map>;
 
@@ -70,6 +72,7 @@ class NodeInfo {
   }
 
   NodeType type() const { return type_; }
+  void set_type(NodeType type) { type_ = type; }
   NodeType IntersectType(NodeType other) {
     return type_ = maglev::IntersectType(type_, other);
   }
@@ -404,6 +407,8 @@ class KnownNodeAspects {
 
   void ClearUnstableNodeAspectsForStoreMap(StoreMap* node,
                                            bool is_tracing_enabled);
+  void ClearUnstableNodeAspectsForMigration(Node* node,
+                                            bool is_tracing_enabled);
   void ClearUnstableNodeAspectsForElementsTransition(
       const ZoneVector<compiler::MapRef>& transition_sources,
       bool is_tracing_enabled);
@@ -548,35 +553,22 @@ class KnownNodeAspects {
 
   EnsureTypeResult EnsureType(compiler::JSHeapBroker* broker, ValueNode* node,
                               NodeType type, NodeType* old_type = nullptr) {
-    NodeType static_type = node->GetStaticType(broker);
-    if (old_type) *old_type = static_type;
-    if (NodeTypeIs(static_type, type, NodeTypeIsVariant::kAllowNone)) {
-      if (static_type == NodeType::kNone) {
-        return EnsureTypeResult::kContradiction;
-      }
-      return EnsureTypeResult::kAlreadyHadType;
-    }
-    NodeInfo* known_info = GetOrCreateInfoFor(broker, node);
-    if (old_type) *old_type = known_info->type();
-    if (NodeTypeIs(known_info->type(), type, NodeTypeIsVariant::kAllowNone)) {
-      if (known_info->type() == NodeType::kNone) {
-        return EnsureTypeResult::kContradiction;
-      }
-      return EnsureTypeResult::kAlreadyHadType;
-    }
-    known_info->IntersectType(type);
-    if (auto phi = node->TryCast<Phi>()) {
-      known_info->IntersectType(phi->type());
-    }
-    if (known_info->type() == NodeType::kNone) {
-      return EnsureTypeResult::kContradiction;
-    }
-    return EnsureTypeResult::kTypeUpdated;
+    return EnsureTypeHelper(broker, node, type, old_type,
+                            UpdateTypeOnContradiction{true});
+  }
+
+  EnsureTypeResult TryEnsureType(compiler::JSHeapBroker* broker,
+                                 ValueNode* node, NodeType type,
+                                 NodeType* old_type = nullptr) {
+    return EnsureTypeHelper(broker, node, type, old_type,
+                            UpdateTypeOnContradiction{false});
   }
 
   void Merge(const KnownNodeAspects& other, Zone* zone);
-  void MergeForLoop(const KnownNodeAspects& backedge, Zone* zone,
-                    const LoopEffects* loop_effects);
+  V8_EXPORT_PRIVATE void MergeForLoop(const KnownNodeAspects& backedge,
+                                      Zone* zone,
+                                      const LoopEffects* loop_effects,
+                                      bool loop_has_effects);
 
   // If IsCompatibleWithLoopHeader(other) returns true, it means that
   // Merge(other) would not remove any information from `this`.
@@ -834,8 +826,7 @@ class KnownNodeAspects {
                          std::is_same_v<NodeT,
                                         CheckMapsWithMigrationAndDeopt> ||
                          std::is_same_v<NodeT, MigrateMapIfNeeded>) {
-      // These instructions only migrate representations of values, not the
-      // values themselves, so cached values are still valid.
+      ClearUnstableNodeAspectsForMigration(node, is_tracing_enabled);
     } else if constexpr (std::is_same_v<NodeT, StoreMap>) {
       ClearUnstableNodeAspectsForStoreMap(node, is_tracing_enabled);
     } else if constexpr (std::is_same_v<NodeT, TransitionElementsKind> ||
@@ -870,11 +861,57 @@ class KnownNodeAspects {
         virtual_objects_() {}
 
  private:
+  EnsureTypeResult EnsureTypeHelper(
+      compiler::JSHeapBroker* broker, ValueNode* node, NodeType type,
+      NodeType* old_type,
+      UpdateTypeOnContradiction update_type_on_contradiction) {
+    NodeType static_type = node->GetStaticType(broker);
+    if (old_type) *old_type = static_type;
+    if (NodeTypeIs(static_type, type, NodeTypeIsVariant::kAllowNone)) {
+      if (static_type == NodeType::kNone) {
+        return EnsureTypeResult::kContradiction;
+      }
+      return EnsureTypeResult::kAlreadyHadType;
+    }
+    NodeInfo* known_info = update_type_on_contradiction
+                               ? GetOrCreateInfoFor(broker, node)
+                               : TryGetInfoFor(node);
+    NodeType current_type = static_type;
+    if (known_info) {
+      current_type = known_info->type();
+      if (old_type) *old_type = current_type;
+      if (NodeTypeIs(current_type, type, NodeTypeIsVariant::kAllowNone)) {
+        if (current_type == NodeType::kNone) {
+          return EnsureTypeResult::kContradiction;
+        }
+        return EnsureTypeResult::kAlreadyHadType;
+      }
+    }
+    NodeType new_type = IntersectType(current_type, type);
+    if (auto phi = node->TryCast<Phi>()) {
+      new_type = IntersectType(new_type, phi->type());
+    }
+    if (new_type == NodeType::kNone) {
+      if (update_type_on_contradiction) {
+        DCHECK_NOT_NULL(known_info);
+        known_info->set_type(NodeType::kNone);
+      }
+      return EnsureTypeResult::kContradiction;
+    }
+    if (!known_info) {
+      known_info = GetOrCreateInfoFor(broker, node);
+    }
+    known_info->set_type(new_type);
+    return EnsureTypeResult::kTypeUpdated;
+  }
+
   bool SetContextCachedValue(ValueNode* context, int offset, ValueNode* value,
                              MaybeAssignedFlag assigned);
 
   SmallZoneVector<LoadedContextSlotsKey, 8> ClearAliasedContextSlotsFor(
       Graph* graph, ValueNode* context, int offset, ValueNode* value);
+
+  bool MarkSingleMapAsStale(ValueNode* node, bool is_tracing_enabled);
 
   static constexpr uint32_t kEffectEpochForPureInstructions =
       std::numeric_limits<uint32_t>::max();

@@ -24,7 +24,8 @@ add_definitions(
   "-DV8_TYPED_ARRAY_MAX_SIZE_IN_HEAP=64"
   "-DV8_USE_DEFAULT_HASHER_SECRET=true"
   "-DV8_ENABLE_UNDEFINED_DOUBLE"
-  "-DV8_CPPGC_MICROTASK_QUEUE"
+  "-DV8_ENABLE_TDZ_HOLE"
+  "-DV8_USE_METAGEN_INSTANCE_TYPES=0"
   "-DV8_ENABLE_LAZY_SOURCE_POSITIONS"
   "-DLIBC_NAMESPACE=__llvm_libc_cr"
   "-DABSL_ALLOCATOR_NOTHROW=1"
@@ -104,9 +105,14 @@ string(CONCAT is-x64 $<OR:
   $<STREQUAL:${CMAKE_SYSTEM_PROCESSOR},AMD64>,
   $<STREQUAL:${CMAKE_SYSTEM_PROCESSOR},x86_64>
 >)
+string(CONCAT is-64bit-sandbox-arch $<OR:
+  ${is-x64},
+  ${is-arm64}
+>)
 
 option(V8_ENABLE_CONCURRENT_MARKING "Enable concurrent marking" ON)
 option(V8_ENABLE_I18N "Enable Internationalization support")
+option(V8_ENABLE_SANDBOX "Enable V8 Sandbox and Pointer Compression (64-bit x64/arm64)" ON)
 option(enable-fPIC "Enable Position-Independent Code" OFF)
 
 set(
@@ -131,6 +137,17 @@ set(
   $<${is-ppc64}:V8_ENABLE_MAGLEV>
   $<${is-s390}:V8_TARGET_ARCH_S390X>
   $<${is-s390}:V8_ENABLE_MAGLEV>
+  $<$<AND:$<BOOL:${V8_ENABLE_SANDBOX}>,${is-64bit-sandbox-arch}>:V8_COMPRESS_POINTERS>
+  $<$<AND:$<BOOL:${V8_ENABLE_SANDBOX}>,${is-64bit-sandbox-arch}>:V8_COMPRESS_POINTERS_IN_SHARED_CAGE>
+  $<$<AND:$<BOOL:${V8_ENABLE_SANDBOX}>,${is-64bit-sandbox-arch}>:V8_31BIT_SMIS_ON_64BIT_ARCH>
+  $<$<AND:$<BOOL:${V8_ENABLE_SANDBOX}>,${is-64bit-sandbox-arch}>:V8_CONTIGUOUS_COMPRESSED_RO_SPACE>
+  $<$<AND:$<BOOL:${V8_ENABLE_SANDBOX}>,${is-64bit-sandbox-arch}>:V8_CONTIGUOUS_COMPRESSED_RO_SPACE_SIZE_MB=8>
+  $<$<AND:$<BOOL:${V8_ENABLE_SANDBOX}>,${is-64bit-sandbox-arch}>:V8_ENABLE_SANDBOX>
+  $<$<AND:$<BOOL:${V8_ENABLE_SANDBOX}>,${is-64bit-sandbox-arch}>:V8_EXTERNAL_CODE_SPACE>
+  $<$<AND:$<BOOL:${V8_ENABLE_SANDBOX}>,${is-64bit-sandbox-arch}>:CPPGC_CAGED_HEAP>
+  $<$<AND:$<BOOL:${V8_ENABLE_SANDBOX}>,${is-64bit-sandbox-arch}>:CPPGC_YOUNG_GENERATION>
+  $<$<AND:$<BOOL:${V8_ENABLE_SANDBOX}>,${is-64bit-sandbox-arch}>:CPPGC_POINTER_COMPRESSION>
+  $<$<AND:$<BOOL:${V8_ENABLE_SANDBOX}>,${is-64bit-sandbox-arch}>:CPPGC_SLIM_WRITE_BARRIER>
   $<${is-win}:NOMINMAX>
   $<$<AND:${is-win},${is-x64}>:V8_OS_WIN_X64>
   $<$<BOOL:${V8_ENABLE_CONCURRENT_MARKING}>:V8_CONCURRENT_MARKING>
@@ -348,10 +365,14 @@ list(REMOVE_ITEM heap-sources
   v8/src/heap/conservative-stack-visitor.cc
   v8/src/heap/reference-summarizer.cc
   v8/src/heap/setup-heap-internal.cc
-  v8/src/heap/cppgc-internal/caged-heap-local-data.cc
-  v8/src/heap/cppgc-internal/caged-heap.cc
   v8/src/heap/cppgc-internal/testing.cc
 )
+if (NOT V8_ENABLE_SANDBOX OR (NOT is-arm64 AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|x86_64)$"))
+  list(REMOVE_ITEM heap-sources
+    v8/src/heap/cppgc-internal/caged-heap-local-data.cc
+    v8/src/heap/cppgc-internal/caged-heap.cc
+  )
+endif()
 
 if(WIN32)
   list(APPEND heap-sources
@@ -648,8 +669,6 @@ list(REMOVE_ITEM compiler-sources
 )
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|x86_64)$")
   list(REMOVE_ITEM compiler-sources
-    v8/src/compiler/linear-scheduler.cc
-    v8/src/compiler/revectorizer.cc
     v8/src/compiler/turboshaft/wasm-revec-phase.cc
     v8/src/compiler/turboshaft/wasm-revec-reducer.cc
   )
@@ -1156,9 +1175,11 @@ set(torque_outputs
   ${PROJECT_BINARY_DIR}/torque-generated/builtin-definitions.h
   ${PROJECT_BINARY_DIR}/torque-generated/class-forward-declarations.h
   ${PROJECT_BINARY_DIR}/torque-generated/csa-types.h
+  ${PROJECT_BINARY_DIR}/torque-generated/debug-reader-classes-list.h
   ${PROJECT_BINARY_DIR}/torque-generated/enum-verifiers.cc
   ${PROJECT_BINARY_DIR}/torque-generated/exported-macros-assembler.cc
   ${PROJECT_BINARY_DIR}/torque-generated/exported-macros-assembler.h
+  ${PROJECT_BINARY_DIR}/torque-generated/instance-type-checker-lists.h
   ${PROJECT_BINARY_DIR}/torque-generated/instance-types.h
   ${PROJECT_BINARY_DIR}/torque-generated/interface-descriptors.inc
   ${PROJECT_BINARY_DIR}/torque-generated/objects-body-descriptors-inl.inc

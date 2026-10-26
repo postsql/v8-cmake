@@ -270,154 +270,155 @@ class ExceptionHandlerInfo;
   V(UnsafeSmiTagUint32)                 \
   V(UnsafeSmiUntag)
 
-#define VALUE_NODE_LIST(V)                                            \
-  V(Identity)                                                         \
-  V(DeadValue)                                                        \
-  V(AllocationBlock)                                                  \
-  V(ArgumentsElements)                                                \
-  V(ArgumentsLength)                                                  \
-  V(RestLength)                                                       \
-  V(Call)                                                             \
-  V(CallBuiltin)                                                      \
-  V(CallForwardVarargs)                                               \
-  V(CallRuntime)                                                      \
-  V(CallWithArrayLike)                                                \
-  V(CallWithSpread)                                                   \
-  V(CallKnownApiFunction)                                             \
-  V(CallKnownBuiltin)                                                 \
-  V(CallKnownJSFunction)                                              \
-  V(CallSelf)                                                         \
-  V(Construct)                                                        \
-  V(ConstructForwardVarargs)                                          \
-  V(CheckConstructResult)                                             \
-  V(CheckDerivedConstructResult)                                      \
-  V(ConstructWithSpread)                                              \
-  V(ConvertReceiver)                                                  \
-  V(ConvertHoleToUndefined)                                           \
-  V(CreateArrayLiteral)                                               \
-  V(CreateShallowArrayLiteral)                                        \
-  V(CreateObjectLiteral)                                              \
-  V(CreateShallowObjectLiteral)                                       \
-  V(CreateFunctionContext)                                            \
-  V(CreateClosure)                                                    \
-  V(FastCreateClosure)                                                \
-  V(CreateRegExpLiteral)                                              \
-  V(DeleteProperty)                                                   \
-  V(EnsureWritableFastElements)                                       \
-  V(ExtendPropertiesBackingStore)                                     \
-  V(InlinedAllocation)                                                \
-  V(ForInPrepare)                                                     \
-  V(ForInNext)                                                        \
-  V(GeneratorRestoreRegister)                                         \
-  V(GetIterator)                                                      \
-  V(GetSecondReturnedValue)                                           \
-  V(GetTemplateObject)                                                \
-  V(HasInPrototypeChain)                                              \
-  V(InitialValue)                                                     \
-  V(LoadTaggedField)                                                  \
-  V(LoadContextSlotNoCells)                                           \
-  V(LoadContextSlot)                                                  \
-  V(LoadFloat64)                                                      \
-  V(LoadInt32)                                                        \
-  V(LoadTaggedFieldByFieldIndex)                                      \
-  V(LoadFixedArrayElement)                                            \
-  V(LoadFixedDoubleArrayElement)                                      \
-  V(LoadHoleyFixedDoubleArrayElement)                                 \
-  V(LoadSignedIntDataViewElement)                                     \
-  V(LoadDoubleDataViewElement)                                        \
-  V(LoadTypedArrayLength)                                             \
-  V(LoadDataViewByteLength)                                           \
-  V(LoadDataViewDataPointer)                                          \
-  V(LoadSignedIntTypedArrayElement)                                   \
-  V(LoadUnsignedIntTypedArrayElement)                                 \
-  V(LoadDoubleTypedArrayElement)                                      \
-  V(LoadSignedIntConstantTypedArrayElement)                           \
-  V(LoadUnsignedIntConstantTypedArrayElement)                         \
-  V(LoadDoubleConstantTypedArrayElement)                              \
-  V(LoadEnumCacheLength)                                              \
-  V(LoadGlobal)                                                       \
-  V(LoadNamedGeneric)                                                 \
-  V(LoadNamedFromSuperGeneric)                                        \
-  V(LoadDictionaryField)                                              \
-  V(MaybeGrowFastElements)                                            \
-  V(MigrateMapIfNeeded)                                               \
-  V(SetNamedGeneric)                                                  \
-  V(DefineNamedOwnGeneric)                                            \
-  V(StoreInArrayLiteralGeneric)                                       \
-  V(StoreGlobal)                                                      \
-  V(GetKeyedGeneric)                                                  \
-  V(SetKeyedGeneric)                                                  \
-  V(DefineKeyedOwnGeneric)                                            \
-  V(Phi)                                                              \
-  V(RegisterInput)                                                    \
-  V(CheckedInternalizedString)                                        \
-  V(TruncateCheckedNumberAsSafeIntToInt32)                            \
-  V(TruncateUnsafeNumberAsSafeIntToInt32)                             \
-  V(TruncateFloat64AsSafeIntToInt32)                                  \
-  V(TruncateHoleyFloat64AsSafeIntToInt32)                             \
-  V(TruncateCheckedNumberOrOddballToInt32)                            \
-  V(TruncateUnsafeNumberOrOddballToInt32)                             \
-  V(TruncateFloat64ToInt32)                                           \
-  V(TruncateHoleyFloat64ToInt32)                                      \
-  V(TruncateUint32ToInt32)                                            \
-  V(Int32ToUint8Clamped)                                              \
-  V(Uint32ToUint8Clamped)                                             \
-  V(Float64ToUint8Clamped)                                            \
-  V(CheckedNumberOrOddballToUint8Clamped)                             \
-  V(Int32CountLeadingZeros)                                           \
-  V(TaggedCountLeadingZeros)                                          \
-  V(Float64CountLeadingZeros)                                         \
-  V(IntPtrToBoolean)                                                  \
-  V(CheckedNumberOrOddballToFloat64)                                  \
-  V(CheckedNumberOrOddballToHoleyFloat64)                             \
-  V(UnsafeNumberOrOddballToFloat64)                                   \
-  V(UnsafeNumberOrOddballToHoleyFloat64)                              \
-  V(UnsafeHoleyFloat64ToFloat64)                                      \
-  V(UnsafeFloat64ToHoleyFloat64)                                      \
-  V(Float64ToSilencedFloat64)                                         \
-  IF_UD(V, HoleyFloat64IsUndefinedOrHole)                             \
-  IF_NOT_UD(V, HoleyFloat64IsHole)                                    \
-  V(LogicalNot)                                                       \
-  V(SetPendingMessage)                                                \
-  V(StringAt)                                                         \
-  V(StringEqual)                                                      \
-  V(StringLength)                                                     \
-  V(StringConcat)                                                     \
-  V(StringIndexOf)                                                    \
-  IF_INTL(V, StringLocaleCompareIntl)                                 \
-  V(ConsStringMap)                                                    \
-  V(UnwrapStringWrapper)                                              \
-  V(ToBoolean)                                                        \
-  V(ToBooleanLogicalNot)                                              \
-  V(AllocateElementsArray)                                            \
-  V(TaggedEqual)                                                      \
-  V(TaggedNotEqual)                                                   \
-  V(TestInstanceOf)                                                   \
-  V(TestUndetectable)                                                 \
-  V(TestTypeOf)                                                       \
-  V(ToName)                                                           \
-  V(ToNumberOrNumeric)                                                \
-  V(ToObject)                                                         \
-  V(ToString)                                                         \
-  V(TransitionElementsKind)                                           \
-  V(Int32ToString)                                                    \
-  V(Float64ToString)                                                  \
-  V(SmiToString)                                                      \
-  V(NumberToString)                                                   \
-  V(UpdateJSArrayLength)                                              \
-  V(VirtualObject)                                                    \
-  V(GetContinuationPreservedEmbedderData)                             \
-  V(ReturnedValue)                                                    \
-  V(StringSlice)                                                      \
-  V(StringSubstring)                                                  \
-  CONSTANT_VALUE_NODE_LIST(V)                                         \
-  CONVERSION_NODE_LIST(V)                                             \
-  INT32_OPERATIONS_NODE_LIST(V)                                       \
-  FLOAT64_OPERATIONS_NODE_LIST(V)                                     \
-  SMI_OPERATIONS_NODE_LIST(V)                                         \
-  GENERIC_OPERATIONS_NODE_LIST(V)                                     \
-  BIGINT_OPERATIONS_NODE_LIST(V)                                      \
-  INLINE_BUILTIN_NODE_LIST(V)                                         \
+#define VALUE_NODE_LIST(V)                    \
+  V(Identity)                                 \
+  V(DeadValue)                                \
+  V(AllocationBlock)                          \
+  V(ArgumentsElements)                        \
+  V(ArgumentsLength)                          \
+  V(RestLength)                               \
+  V(Call)                                     \
+  V(CallBuiltin)                              \
+  V(CallForwardVarargs)                       \
+  V(CallRuntime)                              \
+  V(CallWithArrayLike)                        \
+  V(CallWithSpread)                           \
+  V(CallKnownApiFunction)                     \
+  V(CallKnownBuiltin)                         \
+  V(CallKnownJSFunction)                      \
+  V(CallSelf)                                 \
+  V(Construct)                                \
+  V(ConstructForwardVarargs)                  \
+  V(CheckConstructResult)                     \
+  V(CheckDerivedConstructResult)              \
+  V(ConstructWithSpread)                      \
+  V(ConvertReceiver)                          \
+  V(ConvertHoleToUndefined)                   \
+  V(CreateArrayLiteral)                       \
+  V(CreateShallowArrayLiteral)                \
+  V(CreateObjectLiteral)                      \
+  V(CreateShallowObjectLiteral)               \
+  V(CreateFunctionContext)                    \
+  V(CreateClosure)                            \
+  V(FastCreateClosure)                        \
+  V(CreateRegExpLiteral)                      \
+  V(DeleteProperty)                           \
+  V(EnsureWritableFastElements)               \
+  V(ExtendPropertiesBackingStore)             \
+  V(InlinedAllocation)                        \
+  V(ForInPrepare)                             \
+  V(ForInNext)                                \
+  V(GeneratorRestoreRegister)                 \
+  V(GetIterator)                              \
+  V(GetSecondReturnedValue)                   \
+  V(GetTemplateObject)                        \
+  V(HasInPrototypeChain)                      \
+  V(InitialValue)                             \
+  V(LoadTaggedField)                          \
+  V(LoadContextSlotNoCells)                   \
+  V(LoadContextSlot)                          \
+  V(LoadFloat64)                              \
+  V(LoadInt32)                                \
+  V(LoadTaggedFieldByFieldIndex)              \
+  V(LoadFixedArrayElement)                    \
+  V(LoadFixedDoubleArrayElement)              \
+  V(LoadHoleyFixedDoubleArrayElement)         \
+  V(LoadInt32DataViewElement)                 \
+  V(LoadUint32DataViewElement)                \
+  V(LoadDoubleDataViewElement)                \
+  V(LoadTypedArrayLength)                     \
+  V(LoadDataViewByteLength)                   \
+  V(LoadDataViewDataPointer)                  \
+  V(LoadSignedIntTypedArrayElement)           \
+  V(LoadUnsignedIntTypedArrayElement)         \
+  V(LoadDoubleTypedArrayElement)              \
+  V(LoadSignedIntConstantTypedArrayElement)   \
+  V(LoadUnsignedIntConstantTypedArrayElement) \
+  V(LoadDoubleConstantTypedArrayElement)      \
+  V(LoadEnumCacheLength)                      \
+  V(LoadGlobal)                               \
+  V(LoadNamedGeneric)                         \
+  V(LoadNamedFromSuperGeneric)                \
+  V(LoadDictionaryField)                      \
+  V(MaybeGrowFastElements)                    \
+  V(MigrateMapIfNeeded)                       \
+  V(SetNamedGeneric)                          \
+  V(DefineNamedOwnGeneric)                    \
+  V(StoreInArrayLiteralGeneric)               \
+  V(StoreGlobal)                              \
+  V(GetKeyedGeneric)                          \
+  V(SetKeyedGeneric)                          \
+  V(DefineKeyedOwnGeneric)                    \
+  V(Phi)                                      \
+  V(RegisterInput)                            \
+  V(CheckedInternalizedString)                \
+  V(TruncateCheckedNumberAsSafeIntToInt32)    \
+  V(TruncateUnsafeNumberAsSafeIntToInt32)     \
+  V(TruncateFloat64AsSafeIntToInt32)          \
+  V(TruncateHoleyFloat64AsSafeIntToInt32)     \
+  V(TruncateCheckedNumberOrOddballToInt32)    \
+  V(TruncateUnsafeNumberOrOddballToInt32)     \
+  V(TruncateFloat64ToInt32)                   \
+  V(TruncateHoleyFloat64ToInt32)              \
+  V(TruncateUint32ToInt32)                    \
+  V(Int32ToUint8Clamped)                      \
+  V(Uint32ToUint8Clamped)                     \
+  V(Float64ToUint8Clamped)                    \
+  V(CheckedNumberOrOddballToUint8Clamped)     \
+  V(Int32CountLeadingZeros)                   \
+  V(TaggedCountLeadingZeros)                  \
+  V(Float64CountLeadingZeros)                 \
+  V(IntPtrToBoolean)                          \
+  V(CheckedNumberOrOddballToFloat64)          \
+  V(CheckedNumberOrOddballToHoleyFloat64)     \
+  V(UnsafeNumberOrOddballToFloat64)           \
+  V(UnsafeNumberOrOddballToHoleyFloat64)      \
+  V(UnsafeHoleyFloat64ToFloat64)              \
+  V(UnsafeFloat64ToHoleyFloat64)              \
+  V(Float64ToSilencedFloat64)                 \
+  IF_UD(V, HoleyFloat64IsUndefinedOrHole)     \
+  IF_NOT_UD(V, HoleyFloat64IsHole)            \
+  V(LogicalNot)                               \
+  V(SetPendingMessage)                        \
+  V(StringAt)                                 \
+  V(StringEqual)                              \
+  V(StringLength)                             \
+  V(StringConcat)                             \
+  V(StringIndexOf)                            \
+  IF_INTL(V, StringLocaleCompareIntl)         \
+  V(ConsStringMap)                            \
+  V(UnwrapStringWrapper)                      \
+  V(ToBoolean)                                \
+  V(ToBooleanLogicalNot)                      \
+  V(AllocateElementsArray)                    \
+  V(TaggedEqual)                              \
+  V(TaggedNotEqual)                           \
+  V(TestInstanceOf)                           \
+  V(TestUndetectable)                         \
+  V(TestTypeOf)                               \
+  V(ToName)                                   \
+  V(ToNumberOrNumeric)                        \
+  V(ToObject)                                 \
+  V(ToString)                                 \
+  V(TransitionElementsKind)                   \
+  V(Int32ToString)                            \
+  V(Float64ToString)                          \
+  V(SmiToString)                              \
+  V(NumberToString)                           \
+  V(UpdateJSArrayLength)                      \
+  V(VirtualObject)                            \
+  V(GetContinuationPreservedEmbedderData)     \
+  V(ReturnedValue)                            \
+  V(StringSlice)                              \
+  V(StringSubstring)                          \
+  CONSTANT_VALUE_NODE_LIST(V)                 \
+  CONVERSION_NODE_LIST(V)                     \
+  INT32_OPERATIONS_NODE_LIST(V)               \
+  FLOAT64_OPERATIONS_NODE_LIST(V)             \
+  SMI_OPERATIONS_NODE_LIST(V)                 \
+  GENERIC_OPERATIONS_NODE_LIST(V)             \
+  BIGINT_OPERATIONS_NODE_LIST(V)              \
+  INLINE_BUILTIN_NODE_LIST(V)                 \
   TURBOLEV_VALUE_NODE_LIST(V)
 
 #define GAP_MOVE_NODE_LIST(V) \
@@ -478,7 +479,7 @@ class ExceptionHandlerInfo;
   V(StoreDoubleTypedArrayElement)             \
   V(StoreIntConstantTypedArrayElement)        \
   V(StoreDoubleConstantTypedArrayElement)     \
-  V(StoreSignedIntDataViewElement)            \
+  V(StoreInt32DataViewElement)                \
   V(StoreDoubleDataViewElement)               \
   V(StoreTaggedFieldNoWriteBarrier)           \
   V(StoreTaggedFieldWithWriteBarrier)         \
@@ -490,9 +491,9 @@ class ExceptionHandlerInfo;
   V(HandleNoHeapWritesInterrupt)              \
   V(ReduceInterruptBudgetForLoop)             \
   V(ReduceInterruptBudgetForReturn)           \
-  V(ThrowReferenceErrorIfHole)                \
-  V(ThrowSuperNotCalledIfHole)                \
-  V(ThrowSuperAlreadyCalledIfNotHole)         \
+  V(ThrowReferenceErrorIfTdzHole)             \
+  V(ThrowSuperNotCalledIfTdzHole)             \
+  V(ThrowSuperAlreadyCalledIfNotTdzHole)      \
   V(ThrowIfNotCallable)                       \
   V(ThrowIfNotSuperConstructor)               \
   V(TransitionElementsKindOrCheckMap)         \
@@ -735,7 +736,7 @@ constexpr bool IsTypedArrayStore(Opcode opcode) {
          opcode == Opcode::kStoreDoubleTypedArrayElement ||
          opcode == Opcode::kStoreIntConstantTypedArrayElement ||
          opcode == Opcode::kStoreDoubleConstantTypedArrayElement ||
-         opcode == Opcode::kStoreSignedIntDataViewElement ||
+         opcode == Opcode::kStoreInt32DataViewElement ||
          opcode == Opcode::kStoreDoubleDataViewElement;
 }
 
@@ -786,22 +787,26 @@ constexpr bool CanBeStoreToNonEscapedObject(Opcode opcode) {
   }
 }
 
-constexpr bool CanBeTheHoleValue(Opcode opcode) {
+constexpr bool CanBeHoleValue(RootIndex hole_index, Opcode opcode) {
+  DCHECK(hole_index == RootIndex::kTheHoleValue ||
+         hole_index == RootIndex::kTdzHoleValue);
   switch (opcode) {
     // TODO(victorgomes): Should we have a list of builtins that could
     // return the hole?
     case Opcode::kCallBuiltin:
-    case Opcode::kCallRuntime:
-    case Opcode::kGeneratorRestoreRegister:
     case Opcode::kIdentity:
-    case Opcode::kInitialValue:
-    case Opcode::kLoadContextSlot:
-    case Opcode::kLoadContextSlotNoCells:
-    case Opcode::kLoadFixedArrayElement:
     case Opcode::kLoadTaggedField:
     case Opcode::kPhi:
     case Opcode::kRootConstant:
       return true;
+    case Opcode::kCallRuntime:
+    case Opcode::kLoadFixedArrayElement:
+      return hole_index == RootIndex::kTheHoleValue;
+    case Opcode::kGeneratorRestoreRegister:
+    case Opcode::kInitialValue:
+    case Opcode::kLoadContextSlot:
+    case Opcode::kLoadContextSlotNoCells:
+      return hole_index == RootIndex::kTdzHoleValue;
     default:
       return false;
   }
@@ -1478,10 +1483,6 @@ class DeoptFrame {
     const base::Vector<ValueNode*> parameters;
     ValueNode* context;
     compiler::OptionalJSFunctionRef maybe_js_target;
-    // If true, the deoptimizer treats this continuation as a catch handler
-    // when a throw arrives at the call, passing the exception in the slot it
-    // pushes itself (kJavaScriptBuiltinContinuationWithCatch frames).
-    bool is_with_catch = false;
   };
 
   using FrameData = base::DiscriminatedUnion<
@@ -1662,16 +1663,15 @@ class BuiltinContinuationDeoptFrame : public DeoptFrame {
                                 base::Vector<ValueNode*> parameters,
                                 ValueNode* context,
                                 compiler::OptionalJSFunctionRef maybe_js_target,
-                                DeoptFrame* parent, bool is_with_catch)
+                                DeoptFrame* parent)
       : DeoptFrame(BuiltinContinuationFrameData{builtin_id, parameters, context,
-                                                maybe_js_target, is_with_catch},
+                                                maybe_js_target},
                    parent) {}
 
   const Builtin& builtin_id() const { return data().builtin_id; }
   base::Vector<ValueNode*> parameters() const { return data().parameters; }
   ValueNode*& context() { return data().context; }
   ValueNode* context() const { return data().context; }
-  bool is_with_catch() const { return data().is_with_catch; }
   bool is_javascript() const { return data().maybe_js_target.has_value(); }
   compiler::JSFunctionRef javascript_target() const {
     return data().maybe_js_target.value();
@@ -1771,8 +1771,8 @@ inline compiler::BytecodeArrayRef DeoptFrame::GetBytecodeArray() const {
 
 class DeoptInfo {
  protected:
-  DeoptInfo(Zone* zone, DeoptFrame* top_frame,
-            compiler::FeedbackSource feedback_to_update);
+  V8_EXPORT_PRIVATE DeoptInfo(Zone* zone, DeoptFrame* top_frame,
+                              compiler::FeedbackSource feedback_to_update);
 
  public:
   DeoptFrame& top_frame() { return *top_frame_; }
@@ -2724,7 +2724,7 @@ class ValueNode : public Node {
   // HoleyFloat64 gives a meaning to. Only false if that is provably not the
   // case, so that whoever writes those bits somewhere they would regain that
   // meaning (a double array, mainly) can skip canonicalizing them.
-  bool MayBeHoleOrUndefinedNan() const;
+  V8_EXPORT_PRIVATE bool MayBeHoleOrUndefinedNan() const;
 
 #ifdef V8_COMPRESS_POINTERS
   constexpr bool decompresses_tagged_result() const {
@@ -2787,14 +2787,16 @@ class ValueNode : public Node {
   compiler::OptionalHeapObjectRef TryGetConstant(
       compiler::JSHeapBroker* broker);
 
-  NodeType GetStaticType(compiler::JSHeapBroker* broker);
-  Range GetStaticRange() const;
+  V8_EXPORT_PRIVATE NodeType GetStaticType(compiler::JSHeapBroker* broker);
+  V8_EXPORT_PRIVATE Range GetStaticRange() const;
 
   bool StaticTypeIs(compiler::JSHeapBroker* broker, NodeType type) {
     return NodeTypeIs(GetStaticType(broker), type);
   }
 
-  Tribool IsTheHole() const;
+  Tribool IsHole(RootIndex hole_index) const;
+  Tribool IsTheHole() const { return IsHole(RootIndex::kTheHoleValue); }
+  Tribool IsTdzHole() const { return IsHole(RootIndex::kTdzHoleValue); }
 
   inline void MaybeRecordUseReprHint(UseRepresentationSet repr);
   inline void MaybeRecordUseReprHint(UseRepresentation repr);
@@ -4849,7 +4851,15 @@ class TestInstanceOf : public FixedInputValueNodeT<3, TestInstanceOf> {
       : Base(bitfield), feedback_(feedback) {}
 
   // The implementation currently calls runtime.
-  static constexpr OpProperties kProperties = OpProperties::JSCall();
+  // Eager deopt frame is attached, since MaglevGraphOptimizer can reduce this
+  // node, and the reduction emits map checks, which can eager deopt.
+  // Unlike generic call nodes like CallBuiltin where attaching eager deopt
+  // frames would be too heavyweight (and are instead handled via
+  // MaglevReducer::CanEagerDeopt), TestInstanceOf is a dedicated opcode where
+  // attaching the frame is cheap and preserves speculative reductions in the
+  // optimizer.
+  static constexpr OpProperties kProperties =
+      OpProperties::EagerDeopt() | OpProperties::JSCall();
   DECLARE_INPUTS(Context, Object, Callable)
   DECLARE_INPUT_TYPES(Tagged, Tagged, Tagged)
 
@@ -5291,7 +5301,9 @@ class HeapConstant : public FixedInputValueNodeT<0, HeapConstant> {
     return Object::BooleanValue(*object_.object(), local_isolate);
   }
 
+  bool IsAnyHole() const { return object_.IsAnyHole(); }
   bool IsTheHole() const { return object_.IsTheHole(); }
+  bool IsTdzHole() const { return object_.IsTdzHole(); }
 
   void SetValueLocationConstraints();
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
@@ -8904,14 +8916,23 @@ class StoreFixedHoleyDoubleArrayElement
       : Base(bitfield) {}
 };
 
-class LoadSignedIntDataViewElement
-    : public FixedInputValueNodeT<4, LoadSignedIntDataViewElement> {
+// LoadInt32DataViewElement handles loads for all integer DataView types whose
+// values fit in a 32-bit signed integer (Int8, Uint8, Uint8Clamped, Int16,
+// Uint16, Int32). Uint32 is handled separately by LoadUint32DataViewElement
+// because the loaded uint32 value range doesn't fit in an int32, so we need to
+// explicitly return a Uint32.
+class LoadInt32DataViewElement
+    : public FixedInputValueNodeT<4, LoadInt32DataViewElement> {
+  using Base = FixedInputValueNodeT<4, LoadInt32DataViewElement>;
+
  public:
-  explicit LoadSignedIntDataViewElement(uint64_t bitfield,
-                                        ExternalArrayType type)
-      : Base(bitfield), type_(type) {
+  explicit LoadInt32DataViewElement(uint64_t bitfield, ExternalArrayType type)
+      : Base(bitfield | ExternalArrayTypeField::encode(type)) {
     DCHECK(type == ExternalArrayType::kExternalInt8Array ||
+           type == ExternalArrayType::kExternalUint8Array ||
+           type == ExternalArrayType::kExternalUint8ClampedArray ||
            type == ExternalArrayType::kExternalInt16Array ||
+           type == ExternalArrayType::kExternalUint16Array ||
            type == ExternalArrayType::kExternalInt32Array);
   }
 
@@ -8923,20 +8944,52 @@ class LoadSignedIntDataViewElement
   void SetValueLocationConstraints();
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
 
-  auto options() const { return std::tuple{type_}; }
+  auto options() const { return std::tuple{external_array_type()}; }
 
-  ExternalArrayType external_array_type() const { return type_; }
+  ExternalArrayType external_array_type() const {
+    return ExternalArrayTypeField::decode(bitfield());
+  }
 
  private:
-  ExternalArrayType type_;
+  using ExternalArrayTypeField = NextBitField<ExternalArrayType, 4>;
+};
+
+class LoadUint32DataViewElement
+    : public FixedInputValueNodeT<4, LoadUint32DataViewElement> {
+  using Base = FixedInputValueNodeT<4, LoadUint32DataViewElement>;
+
+ public:
+  explicit LoadUint32DataViewElement(
+      uint64_t bitfield,
+      ExternalArrayType type = ExternalArrayType::kExternalUint32Array)
+      : Base(bitfield) {
+    DCHECK_EQ(type, ExternalArrayType::kExternalUint32Array);
+  }
+
+  static constexpr OpProperties kProperties =
+      OpProperties::CanRead() | OpProperties::Uint32();
+  DECLARE_INPUTS(Object, DataPointer, Index, IsLittleEndian)
+  DECLARE_INPUT_TYPES(Tagged, RawPtr, Int32, Tagged)
+
+  void SetValueLocationConstraints();
+  void GenerateCode(MaglevAssembler*, const ProcessingState&);
+
+  auto options() const { return std::tuple{external_array_type()}; }
+
+  ExternalArrayType external_array_type() const {
+    return ExternalArrayType::kExternalUint32Array;
+  }
 };
 
 class LoadDoubleDataViewElement
     : public FixedInputValueNodeT<4, LoadDoubleDataViewElement> {
+  using Base = FixedInputValueNodeT<4, LoadDoubleDataViewElement>;
+
  public:
   explicit LoadDoubleDataViewElement(uint64_t bitfield, ExternalArrayType type)
-      : Base(bitfield) {
-    DCHECK_EQ(type, type_);
+      : Base(bitfield | ExternalArrayTypeField::encode(type)) {
+    DCHECK(type == ExternalArrayType::kExternalFloat32Array ||
+           type == ExternalArrayType::kExternalFloat64Array);
   }
 
   static constexpr OpProperties kProperties =
@@ -8947,11 +9000,14 @@ class LoadDoubleDataViewElement
   void SetValueLocationConstraints();
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
 
-  auto options() const { return std::tuple{type_}; }
+  auto options() const { return std::tuple{external_array_type()}; }
+
+  ExternalArrayType external_array_type() const {
+    return ExternalArrayTypeField::decode(bitfield());
+  }
 
  private:
-  static constexpr ExternalArrayType type_ =
-      ExternalArrayType::kExternalFloat64Array;
+  using ExternalArrayTypeField = NextBitField<ExternalArrayType, 4>;
 };
 
 #define LOAD_TYPED_ARRAY(name, properties, ...)                        \
@@ -9101,19 +9157,31 @@ STORE_CONSTANT_TYPED_ARRAY(StoreIntConstantTypedArrayElement,
                            UINT8_CLAMPED_ELEMENTS, UINT16_ELEMENTS,
                            UINT16_ELEMENTS, UINT32_ELEMENTS)
 STORE_CONSTANT_TYPED_ARRAY(StoreDoubleConstantTypedArrayElement,
-                           OpProperties::CanWrite(), HoleyFloat64,
-                           FLOAT32_ELEMENTS, FLOAT64_ELEMENTS)
+                           OpProperties::CanWrite(), Float64, FLOAT32_ELEMENTS,
+                           FLOAT64_ELEMENTS)
 #undef STORE_CONSTANT_TYPED_ARRAY
 
-class StoreSignedIntDataViewElement
-    : public FixedInputNodeT<5, StoreSignedIntDataViewElement> {
+// StoreInt32DataViewElement handles stores for all integer DataView types
+// (Int8, Uint8, Uint8Clamped, Int16, Uint16, Int32, Uint32).
+// In JavaScript, all integer DataView setters (including Uint8/Uint16/Uint32)
+// perform ToNumber and truncate the value to 32 bits (ToInt32 / ToUint32).
+// Since truncation and memory store of the lower 8, 16, or 32 bits write the
+// exact same bit pattern regardless of signedness, a single Int32 store node
+// can represent all integer stores without needing a separate StoreUint32 node.
+class StoreInt32DataViewElement
+    : public FixedInputNodeT<5, StoreInt32DataViewElement> {
+  using Base = FixedInputNodeT<5, StoreInt32DataViewElement>;
+
  public:
-  explicit StoreSignedIntDataViewElement(uint64_t bitfield,
-                                         ExternalArrayType type)
-      : Base(bitfield), type_(type) {
+  explicit StoreInt32DataViewElement(uint64_t bitfield, ExternalArrayType type)
+      : Base(bitfield | ExternalArrayTypeField::encode(type)) {
     DCHECK(type == ExternalArrayType::kExternalInt8Array ||
+           type == ExternalArrayType::kExternalUint8Array ||
+           type == ExternalArrayType::kExternalUint8ClampedArray ||
            type == ExternalArrayType::kExternalInt16Array ||
-           type == ExternalArrayType::kExternalInt32Array);
+           type == ExternalArrayType::kExternalUint16Array ||
+           type == ExternalArrayType::kExternalInt32Array ||
+           type == ExternalArrayType::kExternalUint32Array);
   }
 
   static constexpr OpProperties kProperties = OpProperties::CanWrite();
@@ -9123,18 +9191,25 @@ class StoreSignedIntDataViewElement
   void SetValueLocationConstraints();
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
 
-  ExternalArrayType external_array_type() const { return type_; }
+  auto options() const { return std::tuple{external_array_type()}; }
+
+  ExternalArrayType external_array_type() const {
+    return ExternalArrayTypeField::decode(bitfield());
+  }
 
  private:
-  ExternalArrayType type_;
+  using ExternalArrayTypeField = NextBitField<ExternalArrayType, 4>;
 };
 
 class StoreDoubleDataViewElement
     : public FixedInputNodeT<5, StoreDoubleDataViewElement> {
+  using Base = FixedInputNodeT<5, StoreDoubleDataViewElement>;
+
  public:
   explicit StoreDoubleDataViewElement(uint64_t bitfield, ExternalArrayType type)
-      : Base(bitfield) {
-    DCHECK_EQ(type, ExternalArrayType::kExternalFloat64Array);
+      : Base(bitfield | ExternalArrayTypeField::encode(type)) {
+    DCHECK(type == ExternalArrayType::kExternalFloat32Array ||
+           type == ExternalArrayType::kExternalFloat64Array);
   }
 
   static constexpr OpProperties kProperties = OpProperties::CanWrite();
@@ -9143,6 +9218,15 @@ class StoreDoubleDataViewElement
 
   void SetValueLocationConstraints();
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
+
+  auto options() const { return std::tuple{external_array_type()}; }
+
+  ExternalArrayType external_array_type() const {
+    return ExternalArrayTypeField::decode(bitfield());
+  }
+
+ private:
+  using ExternalArrayTypeField = NextBitField<ExternalArrayType, 4>;
 };
 
 class StoreInt32 : public FixedInputNodeT<2, StoreInt32> {
@@ -9275,8 +9359,7 @@ class StoreMap : public FixedInputNodeT<1, StoreMap> {
     kInlinedAllocation,
     kTransitioning,
   };
-  explicit StoreMap(uint64_t bitfield, compiler::MapRef map, Kind kind)
-      : Base(bitfield | KindField::encode(kind)), map_(map) {}
+  explicit StoreMap(uint64_t bitfield, compiler::MapRef map, Kind kind);
 
   static constexpr OpProperties kProperties =
       OpProperties::CanWrite() | OpProperties::DeferredCall();
@@ -9284,6 +9367,7 @@ class StoreMap : public FixedInputNodeT<1, StoreMap> {
 
   compiler::MapRef map() const { return map_; }
   Kind kind() const { return KindField::decode(bitfield()); }
+  bool NoWriteBarrier() const;
 
   bool is_transitioning() const {
     switch (kind()) {
@@ -9303,6 +9387,7 @@ class StoreMap : public FixedInputNodeT<1, StoreMap> {
 
  private:
   using KindField = NextBitField<Kind, 3>;
+  using MapInReadOnlySpaceField = KindField::Next<bool, 1>;
   const compiler::MapRef map_;
 };
 std::ostream& operator<<(std::ostream& os, StoreMap::Kind);
@@ -10044,10 +10129,14 @@ class Phi : public ValueNodeT<Phi> {
   // TODO(jgruber): More intuitive constructors, if possible.
   Phi(uint64_t bitfield, MergePointInterpreterFrameState* merge_state,
       interpreter::Register owner)
+      : Phi(bitfield, merge_state, owner, NodeType::kUnknown) {}
+
+  Phi(uint64_t bitfield, MergePointInterpreterFrameState* merge_state,
+      interpreter::Register owner, NodeType type)
       : Base(bitfield),
         owner_(owner),
         merge_state_(merge_state),
-        type_(NodeType::kUnknown),
+        type_(type),
         post_loop_type_(NodeType::kUnknown) {
     DCHECK_NOT_NULL(merge_state);
   }
@@ -10102,8 +10191,8 @@ class Phi : public ValueNodeT<Phi> {
   // Records a use hint for this Phi. If {force_same_loop} is true, the hint
   // is recorded as a same-loop use, which is important for loop-related
   // optimizations like Phi untagging.
-  void RecordUseReprHint(UseRepresentationSet repr_mask,
-                         bool force_same_loop = false);
+  V8_EXPORT_PRIVATE void RecordUseReprHint(UseRepresentationSet repr_mask,
+                                           bool force_same_loop = false);
 
   UseRepresentationSet use_repr_hints() { return use_repr_hints_; }
   UseRepresentationSet same_loop_use_repr_hints() {
@@ -10687,6 +10776,7 @@ class CallKnownJSFunction : public VarargsValueNodeT<4, CallKnownJSFunction> {
       OpProperties::JSCall() | OpProperties::DeferredCall();
   DECLARE_INPUTS(Target, Context, Receiver, NewTarget)
 
+  JSDispatchHandle dispatch_handle() const { return dispatch_handle_; }
   compiler::SharedFunctionInfoRef shared_function_info() const {
     return shared_function_info_;
   }
@@ -11105,11 +11195,11 @@ class ReduceInterruptBudgetForReturn
   const int amount_;
 };
 
-class ThrowReferenceErrorIfHole
-    : public FixedInputNodeT<1, ThrowReferenceErrorIfHole> {
+class ThrowReferenceErrorIfTdzHole
+    : public FixedInputNodeT<1, ThrowReferenceErrorIfTdzHole> {
  public:
-  explicit ThrowReferenceErrorIfHole(uint64_t bitfield,
-                                     const compiler::NameRef name)
+  explicit ThrowReferenceErrorIfTdzHole(uint64_t bitfield,
+                                        const compiler::NameRef name)
       : Base(bitfield), name_(name) {}
 
   static constexpr OpProperties kProperties =
@@ -11128,10 +11218,10 @@ class ThrowReferenceErrorIfHole
   const compiler::NameRef name_;
 };
 
-class ThrowSuperNotCalledIfHole
-    : public FixedInputNodeT<1, ThrowSuperNotCalledIfHole> {
+class ThrowSuperNotCalledIfTdzHole
+    : public FixedInputNodeT<1, ThrowSuperNotCalledIfTdzHole> {
  public:
-  explicit ThrowSuperNotCalledIfHole(uint64_t bitfield) : Base(bitfield) {}
+  explicit ThrowSuperNotCalledIfTdzHole(uint64_t bitfield) : Base(bitfield) {}
 
   static constexpr OpProperties kProperties =
       OpProperties::CanThrow() | OpProperties::DeferredCall();
@@ -11142,10 +11232,10 @@ class ThrowSuperNotCalledIfHole
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
 };
 
-class ThrowSuperAlreadyCalledIfNotHole
-    : public FixedInputNodeT<1, ThrowSuperAlreadyCalledIfNotHole> {
+class ThrowSuperAlreadyCalledIfNotTdzHole
+    : public FixedInputNodeT<1, ThrowSuperAlreadyCalledIfNotTdzHole> {
  public:
-  explicit ThrowSuperAlreadyCalledIfNotHole(uint64_t bitfield)
+  explicit ThrowSuperAlreadyCalledIfNotTdzHole(uint64_t bitfield)
       : Base(bitfield) {}
 
   static constexpr OpProperties kProperties =

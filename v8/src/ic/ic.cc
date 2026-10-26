@@ -504,7 +504,7 @@ MaybeDirectHandle<Object> LoadGlobalIC::Load(Handle<Name> name,
     if (script_contexts->Lookup(str_name, &lookup_result)) {
       DirectHandle<Context> script_context(
           script_contexts->get(lookup_result.context_index), isolate());
-      if (script_context->IsElementTheHole(lookup_result.slot_index)) {
+      if (script_context->IsElementTdzHole(lookup_result.slot_index)) {
         // Do not install stubs and stay pre-monomorphic for
         // uninitialized accesses.
         THROW_NEW_ERROR(
@@ -988,8 +988,7 @@ bool IC::TryHealMonomorphicIC(const MaybeObjectHandle& handler) {
   // The map/handler is already in the feedback, but we missed in baseline.
   // This means the baseline code was out of sync (still uninitialized).
   // We patch it to the monomorphic handler.
-  MaybePatchCode(FeedbackNexus::ic_handler(*feedback_handler, kind(),
-                                           *lookup_start_object_map()));
+  MaybePatchCode(FeedbackNexus::ic_handler(*feedback_handler, kind()));
   return true;
 }
 
@@ -1007,8 +1006,7 @@ void IC::SetCache(DirectHandle<Name> name, const MaybeObjectHandle& handler) {
     case UNINITIALIZED: {
       UpdateMonomorphicIC(handler, name);
       if (v8_flags.sparkplug_plus) {
-        Builtin ic_handler = FeedbackNexus::ic_handler(
-            *handler, kind(), *lookup_start_object_map());
+        Builtin ic_handler = FeedbackNexus::ic_handler(*handler, kind());
         MaybePatchCode(ic_handler);
       }
       break;
@@ -1762,17 +1760,6 @@ KeyedAccessLoadMode GetUpdatedLoadModeForMap(Isolate* isolate,
 Handle<Object> KeyedLoadIC::LoadElementHandler(
     DirectHandle<Map> receiver_map, KeyedAccessLoadMode new_load_mode,
     MaybeDirectHandle<Map> maybe_transition_target) {
-  // Has a getter interceptor, or is any has and has a query interceptor.
-  if (receiver_map->has_indexed_interceptor() &&
-      (receiver_map->GetIndexedInterceptor()->has_getter() ||
-       (IsAnyHas() && receiver_map->GetIndexedInterceptor()->has_query())) &&
-      !receiver_map->GetIndexedInterceptor()->non_masking()) {
-    // TODO(jgruber): Update counter name.
-    TRACE_HANDLER_STATS(isolate(), KeyedLoadIC_LoadIndexedInterceptorStub);
-    return IsAnyHas() ? BUILTIN_CODE(isolate(), HasIndexedInterceptorIC)
-                      : BUILTIN_CODE(isolate(), LoadIndexedInterceptorIC);
-  }
-
   InstanceType instance_type = receiver_map->instance_type();
   if (instance_type < FIRST_NONSTRING_TYPE) {
     TRACE_HANDLER_STATS(isolate(), KeyedLoadIC_LoadIndexedStringDH);
@@ -1786,6 +1773,23 @@ Handle<Object> KeyedLoadIC::LoadElementHandler(
   if (instance_type == JS_PROXY_TYPE) {
     return LoadHandler::LoadProxy(isolate());
   }
+  if (receiver_map->is_access_check_needed()) {
+    TRACE_HANDLER_STATS(isolate(), KeyedLoadIC_SlowStub);
+    return LoadHandler::LoadSlow(isolate());
+  }
+
+  // Has a getter interceptor, or is any has and has a query interceptor.
+  if (receiver_map->has_indexed_interceptor() &&
+      (receiver_map->GetIndexedInterceptor()->has_getter() ||
+       (IsAnyHas() && receiver_map->GetIndexedInterceptor()->has_query())) &&
+      !receiver_map->GetIndexedInterceptor()->non_masking()) {
+    DCHECK(!receiver_map->is_access_check_needed());
+    // TODO(jgruber): Update counter name.
+    TRACE_HANDLER_STATS(isolate(), KeyedLoadIC_LoadIndexedInterceptorStub);
+    return IsAnyHas() ? BUILTIN_CODE(isolate(), HasIndexedInterceptorIC)
+                      : BUILTIN_CODE(isolate(), LoadIndexedInterceptorIC);
+  }
+
 #if V8_ENABLE_WEBASSEMBLY
   if (InstanceTypeChecker::IsWasmObject(instance_type)) {
     // TODO(jgruber): Update counter name.
@@ -2159,7 +2163,7 @@ MaybeDirectHandle<Object> StoreGlobalIC::Store(Handle<Name> name,
       return TypeError(MessageTemplate::kConstAssign, global, name);
     }
 
-    if (script_context->IsElementTheHole(lookup_result.slot_index)) {
+    if (script_context->IsElementTdzHole(lookup_result.slot_index)) {
       // Do not install stubs and stay pre-monomorphic for uninitialized
       // accesses.
       AllowGarbageCollection yes_gc;
@@ -2318,6 +2322,11 @@ MaybeDirectHandle<Object> StoreIC::Store(Handle<JSAny> object,
       MAYBE_RETURN_NULL(can_store);
       if (!can_store.FromJust()) {
         return isolate()->factory()->undefined_value();
+      }
+      // Restart the lookup iterator updated by CheckPrivateNameStore() for
+      // UpdateCaches() to handle access checks.
+      if (use_ic && IsAccessCheckNeeded(*object)) {
+        it.Restart();
       }
     }
 
@@ -2867,7 +2876,8 @@ void KeyedStoreIC::UpdateStoreElement(Handle<Map> receiver_map,
 Handle<Object> KeyedStoreIC::StoreElementHandler(
     DirectHandle<Map> receiver_map, KeyedAccessStoreMode store_mode,
     MaybeDirectHandle<UnionOf<Smi, Cell>> prev_validity_cell) {
-  if (!IsJSObjectMap(*receiver_map)) {
+  if (!IsJSObjectMap(*receiver_map) || receiver_map->is_access_check_needed() ||
+      receiver_map->IsMapInArrayPrototypeChain(isolate())) {
     // DefineKeyedOwnIC, which is used to define computed fields in instances,
     // should handled by the slow stub below instead of the proxy stub.
     if (IsJSProxyMap(*receiver_map) && !IsDefineKeyedOwnIC()) {
@@ -3178,16 +3188,14 @@ MaybeDirectHandle<Object> KeyedStoreIC::Store(Handle<JSAny> object,
 }
 
 namespace {
-Maybe<bool> StoreOwnElement(Isolate* isolate, DirectHandle<JSArray> array,
-                            Handle<Object> index, DirectHandle<Object> value) {
+V8_WARN_UNUSED_RESULT MaybeDirectHandle<Object> StoreOwnElement(
+    Isolate* isolate, DirectHandle<JSArray> array, Handle<Object> index,
+    DirectHandle<Object> value) {
   DCHECK(IsNumber(*index));
   PropertyKey key(isolate, index);
   LookupIterator it(isolate, array, key, LookupIterator::OWN);
 
-  MAYBE_RETURN(JSObject::DefineOwnPropertyIgnoreAttributes(
-                   &it, value, NONE, Just(ShouldThrow::kThrowOnError)),
-               Nothing<bool>());
-  return Just(true);
+  return JSObject::DefineOwnPropertyIgnoreAttributes(&it, value, NONE);
 }
 }  // namespace
 
@@ -3199,7 +3207,8 @@ MaybeDirectHandle<Object> StoreInArrayLiteralIC::Store(
 
   if (!v8_flags.use_ic || state() == NO_FEEDBACK ||
       MigrateDeprecated(isolate(), array)) {
-    MAYBE_RETURN_NULL(StoreOwnElement(isolate(), array, index, value));
+    RETURN_ON_EXCEPTION(isolate(),
+                        StoreOwnElement(isolate(), array, index, value));
     TraceIC("StoreInArrayLiteralIC", index);
     return value;
   }
@@ -3214,7 +3223,8 @@ MaybeDirectHandle<Object> StoreInArrayLiteralIC::Store(
   }
 
   Handle<Map> old_array_map(array->map(), isolate());
-  MAYBE_RETURN_NULL(StoreOwnElement(isolate(), array, index, value));
+  RETURN_ON_EXCEPTION(isolate(),
+                      StoreOwnElement(isolate(), array, index, value));
 
   if (IsSmi(*index)) {
     DCHECK(!old_array_map->is_abandoned_prototype_map());
@@ -3624,7 +3634,7 @@ RUNTIME_FUNCTION(Runtime_StoreGlobalIC_Slow) {
 
     {
       DisallowGarbageCollection no_gc;
-      if (script_context->IsElementTheHole(lookup_result.slot_index)) {
+      if (script_context->IsElementTdzHole(lookup_result.slot_index)) {
         AllowGarbageCollection yes_gc;
         THROW_NEW_ERROR_RETURN_FAILURE(
             isolate,
@@ -3766,8 +3776,8 @@ RUNTIME_FUNCTION(Runtime_StoreInArrayLiteralIC_Slow) {
   DirectHandle<Object> value = args.at(0);
   DirectHandle<Object> array = args.at(1);
   Handle<Object> index = args.at(2);
-  StoreOwnElement(isolate, Cast<JSArray>(array), index, value);
-  return *value;
+  RETURN_RESULT_OR_FAILURE(
+      isolate, StoreOwnElement(isolate, Cast<JSArray>(array), index, value));
 }
 
 RUNTIME_FUNCTION(Runtime_ElementsTransitionAndStoreIC_Miss) {
@@ -3789,8 +3799,8 @@ RUNTIME_FUNCTION(Runtime_ElementsTransitionAndStoreIC_Miss) {
   }
 
   if (IsStoreInArrayLiteralICKind(kind)) {
-    StoreOwnElement(isolate, Cast<JSArray>(object), key, value);
-    return *value;
+    RETURN_RESULT_OR_FAILURE(
+        isolate, StoreOwnElement(isolate, Cast<JSArray>(object), key, value));
   } else {
     DCHECK(IsKeyedStoreICKind(kind) || IsSetNamedICKind(kind) ||
            IsDefineKeyedOwnICKind(kind));

@@ -8,7 +8,7 @@ Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 diff --git a/v8/include/v8config.h b/v8/include/v8config.h
 --- a/v8/include/v8config.h	(revision 8a773a0c4053aac9a3eb3f7bbd0c54b158f0bf73)
 +++ b/v8/include/v8config.h	(revision ad265bb8c8fb5a06b81cb4168f39f44f1c519d09)
-@@ -402,7 +402,7 @@
+@@ -468,7 +468,7 @@
  // always_inline is available in gcc 4.0 but not very reliable until 4.4.
  // Works around "sorry, unimplemented: inlining failed" build errors with
  // older compilers.

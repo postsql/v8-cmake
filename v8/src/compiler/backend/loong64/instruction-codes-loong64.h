@@ -50,11 +50,12 @@ namespace compiler {
 
 #define TARGET_ARCH_OPCODE_LIST(V)                   \
   TARGET_ARCH_OPCODE_WITH_MEMORY_ACCESS_MODE_LIST(V) \
-  V(Loong64CheckWord32ComparisonInputs)              \
+  V(Loong64CheckWord32SignExtend)                    \
   V(Loong64Add_d)                                    \
   V(Loong64Add_w)                                    \
   V(Loong64AddOvf_d)                                 \
   V(Loong64AddOvf_w)                                 \
+  V(Loong64Add64_3)                                  \
   V(Loong64Add128)                                   \
   V(Loong64Sub_d)                                    \
   V(Loong64Sub_w)                                    \
@@ -106,6 +107,7 @@ namespace compiler {
   V(Loong64Mov)                                      \
   V(Loong64Tst)                                      \
   V(Loong64Cmp32)                                    \
+  V(Loong64Cmp32Eq)                                  \
   V(Loong64Cmp64)                                    \
   V(Loong64Float32Cmp)                               \
   V(Loong64Float32Add)                               \
