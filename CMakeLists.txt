@@ -12,6 +12,7 @@ if(MSVC)
            v8/src/heap/base/asm/x64/push_registers_masm.asm
     PROPERTY LANGUAGE ASM_MASM)
 
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
 endif()
 
 add_definitions(
@@ -1089,6 +1090,7 @@ target_link_libraries(v8_libbase
     $<${is-linux}:rt>
     $<${is-win}:winmm>
     $<${is-win}:dbghelp>
+    "$<$<PLATFORM_ID:Darwin>:-framework CoreFoundation>"
 )
 
 #
