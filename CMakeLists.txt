@@ -25,7 +25,7 @@ add_definitions(
   "-DV8_USE_DEFAULT_HASHER_SECRET=true"
   "-DV8_ENABLE_UNDEFINED_DOUBLE"
   "-DV8_ENABLE_TDZ_HOLE"
-  "-DV8_USE_METAGEN_INSTANCE_TYPES=0"
+  "-DV8_USE_METAGEN=0"
   "-DV8_ENABLE_LAZY_SOURCE_POSITIONS"
   "-DLIBC_NAMESPACE=__llvm_libc_cr"
   "-DABSL_ALLOCATOR_NOTHROW=1"
@@ -176,6 +176,7 @@ set(v8_warning_suppressions
   $<$<CXX_COMPILER_ID:GNU>:-Wno-dangling-pointer>
   $<$<CXX_COMPILER_ID:GNU>:-Wno-changes-meaning>
   $<$<CXX_COMPILER_ID:GNU>:-Wno-invalid-constexpr>
+  $<$<AND:$<BOOL:${is-arm64}>,$<CXX_COMPILER_ID:GNU>>:-flax-vector-conversions>
   $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-Wno-invalid-offsetof>
   $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-Wno-deprecated-declarations>
 )
@@ -1283,6 +1284,11 @@ file(GLOB torque-program-sources
   CONFIGURE_DEPENDS v8/src/torque/*.cc
 )
 list(REMOVE_ITEM torque-program-sources v8/src/torque/tsa-generator.cc)
+list(APPEND torque-program-sources
+  v8/src/torque/ls/json-parser.cc
+  v8/src/torque/ls/json.cc
+  v8/third_party/simdutf/simdutf.cpp
+)
 
 add_executable(torque)
 target_sources(torque PRIVATE ${torque-program-sources})
