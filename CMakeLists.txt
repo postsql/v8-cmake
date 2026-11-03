@@ -13,6 +13,7 @@ if(MSVC)
     PROPERTY LANGUAGE ASM_MASM)
 
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/FI${CMAKE_CURRENT_SOURCE_DIR}/cmake/msvc_compat.h>)
 endif()
 
 add_definitions(
@@ -38,7 +39,7 @@ if(WIN32)
   add_definitions("-DNOMINMAX -DV8_ENABLE_SYSTEM_INSTRUMENTATION")
   # todo: for zlib, need to extract zlib when refactor
   add_definitions("-DX86_WINDOWS")
-  add_definitions("-D_WIN32_WINNT=0x0602")
+  add_definitions("-D_WIN32_WINNT=0x0A00")
 endif()
 
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
@@ -611,17 +612,7 @@ add_library(v8_base_without_compiler STATIC
 )
 
 if (WIN32)
-  if (CMAKE_SYSTEM_VERSION VERSION_GREATER 10) # Windows 10
-    set(windows-version 0x0A00)
-  elseif (CMAKE_SYSTEM_VERSION VERSION_GREATER 6.3) # Windows 8.1
-    set(windows-version 0x0603)
-  elseif (CMAKE_SYSTEM_VERSION VERSION_GREATER 6.2) # Windows 8
-    set(windows-version 0x0602)
-  elseif (CMAKE_SYSTEM_VERSION VERSION_GREATER 6.1) # Windows 7
-    set(windows-version 0x0601)
-  elseif (CMAKE_SYSTEM_VERSION VERSION_GREATER 6.0) # Windows Vista
-    set(windows-version 0x0600)
-  endif()
+  set(windows-version 0x0A00)
 endif()
 
 set_property(SOURCE v8/src/diagnostics/unwinding-info-win64.cc
