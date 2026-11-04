@@ -33,6 +33,7 @@ add_definitions(
   "-DV8_ENABLE_LAZY_SOURCE_POSITIONS"
   "-DLIBC_NAMESPACE=__llvm_libc_cr"
   "-DABSL_ALLOCATOR_NOTHROW=1"
+  "-DV8_LOGGING_LEVEL=1"
 )
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   add_compile_options("-D__has_warning(x)=0")
