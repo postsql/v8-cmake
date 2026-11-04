@@ -14,6 +14,8 @@ if(MSVC)
 
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/FI${CMAKE_CURRENT_SOURCE_DIR}/cmake/msvc_compat.h>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/wd4716>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/wd4715>)
 endif()
 
 add_definitions(
@@ -181,6 +183,8 @@ set(v8_warning_suppressions
   $<$<AND:$<BOOL:${is-arm64}>,$<CXX_COMPILER_ID:GNU>>:-flax-vector-conversions>
   $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-Wno-invalid-offsetof>
   $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-Wno-deprecated-declarations>
+  $<$<CXX_COMPILER_ID:MSVC>:/wd4716>
+  $<$<CXX_COMPILER_ID:MSVC>:/wd4715>
 )
 
 #
