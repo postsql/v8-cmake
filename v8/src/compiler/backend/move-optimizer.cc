@@ -4,8 +4,6 @@
 
 #include "src/compiler/backend/move-optimizer.h"
 
-#include "src/codegen/register-configuration.h"
-
 #if V8_TARGET_ARCH_ARM64
 #include "src/codegen/macro-assembler.h"
 #endif
@@ -33,84 +31,21 @@ struct MoveKey {
 
 class OperandSet {
  public:
-  explicit OperandSet(ZoneVector<InstructionOperand>* buffer)
-      : set_(buffer), fp_reps_(0) {
+  explicit OperandSet(ZoneVector<InstructionOperand>* buffer) : set_(buffer) {
     buffer->clear();
   }
 
-  void InsertOp(const InstructionOperand& op) {
-    set_->push_back(op);
-
-    if (kFPAliasing == AliasingKind::kCombine && op.IsFPRegister()) {
-      fp_reps_ |= RepresentationBit(LocationOperand::cast(op).representation());
-    }
-  }
-
-  bool Contains(const InstructionOperand& op) const {
-    for (const InstructionOperand& elem : *set_) {
-      if (elem.EqualsCanonicalized(op)) return true;
-    }
-    return false;
-  }
+  void InsertOp(const InstructionOperand& op) { set_->push_back(op); }
 
   bool ContainsOpOrAlias(const InstructionOperand& op) const {
-    if (Contains(op)) return true;
-
-    if (kFPAliasing == AliasingKind::kCombine && op.IsFPRegister()) {
-      // Platforms where FP registers have complex aliasing need extra checks.
-      const LocationOperand& loc = LocationOperand::cast(op);
-      MachineRepresentation rep = loc.representation();
-      // If haven't encountered mixed rep FP registers, skip the extra checks.
-      if (!HasMixedFPReps(fp_reps_ | RepresentationBit(rep))) return false;
-
-      // Check register against aliasing registers of other FP representations.
-      MachineRepresentation other_rep1, other_rep2;
-      switch (rep) {
-        case MachineRepresentation::kFloat32:
-          other_rep1 = MachineRepresentation::kFloat64;
-          other_rep2 = MachineRepresentation::kSimd128;
-          break;
-        case MachineRepresentation::kFloat64:
-          other_rep1 = MachineRepresentation::kFloat32;
-          other_rep2 = MachineRepresentation::kSimd128;
-          break;
-        case MachineRepresentation::kSimd128:
-          other_rep1 = MachineRepresentation::kFloat32;
-          other_rep2 = MachineRepresentation::kFloat64;
-          break;
-        default:
-          UNREACHABLE();
-      }
-      const RegisterConfiguration* config = RegisterConfiguration::Default();
-      int base = -1;
-      int aliases =
-          config->GetAliases(rep, loc.register_code(), other_rep1, &base);
-      DCHECK(aliases > 0 || (aliases == 0 && base == -1));
-      while (aliases--) {
-        if (Contains(AllocatedOperand(LocationOperand::REGISTER, other_rep1,
-                                      base + aliases))) {
-          return true;
-        }
-      }
-      aliases = config->GetAliases(rep, loc.register_code(), other_rep2, &base);
-      DCHECK(aliases > 0 || (aliases == 0 && base == -1));
-      while (aliases--) {
-        if (Contains(AllocatedOperand(LocationOperand::REGISTER, other_rep2,
-                                      base + aliases))) {
-          return true;
-        }
-      }
+    for (const InstructionOperand& elem : *set_) {
+      if (elem.InterferesWith(op)) return true;
     }
     return false;
   }
 
  private:
-  static bool HasMixedFPReps(int reps) {
-    return reps && !base::bits::IsPowerOfTwo(reps);
-  }
-
   ZoneVector<InstructionOperand>* set_;
-  int fp_reps_;
 };
 
 int FindFirstNonEmptySlot(const Instruction* instr) {
@@ -560,10 +495,31 @@ bool Is64BitsWide(const InstructionOperand& op) {
 #endif
 }
 
+#if V8_TARGET_ARCH_X64
+bool IsSimd256(const InstructionOperand& op) {
+  return op.IsAnyLocationOperand() &&
+         LocationOperand::cast(&op)->representation() ==
+             MachineRepresentation::kSimd256;
+}
+#endif  // V8_TARGET_ARCH_X64
+
 bool LoadCompare(const MoveOperands* a, const MoveOperands* b) {
   if (!a->source().EqualsCanonicalized(b->source())) {
     return a->source().CompareCanonicalized(b->source());
   }
+#if V8_TARGET_ARCH_X64
+  // Simd256 must be preferred over Simd128 as the group's representative
+  // destination. kSimd256 and kSimd128 may share the same virtual register
+  // (e.g. an elided 128-bit lane-0 extraction aliased to its 256-bit
+  // producer on x64), so a Simd256 destination must never be rewritten to
+  // source from a Simd128 one, which would silently zero the upper 128 bits.
+  if (IsSimd256(a->destination()) && !IsSimd256(b->destination())) {
+    return true;
+  }
+  if (!IsSimd256(a->destination()) && IsSimd256(b->destination())) {
+    return false;
+  }
+#endif  // V8_TARGET_ARCH_X64
   // The replacements below are only safe if wider values are preferred.
   // In particular, replacing an uncompressed pointer with a compressed
   // pointer is disallowed.

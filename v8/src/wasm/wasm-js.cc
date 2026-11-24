@@ -14,7 +14,6 @@
 #include "include/v8-wasm.h"
 #include "src/api/api-inl.h"
 #include "src/api/api-natives.h"
-#include "src/base/fpu.h"
 #include "src/base/logging.h"
 #include "src/base/unique-array.h"
 #include "src/execution/execution.h"
@@ -82,7 +81,11 @@ class WasmStreaming::WasmStreamingImpl {
   void Finish(const WasmStreaming::ModuleCachingCallback& caching_callback) {
     // Finish can only be called on the main thread of the isolate.
     CHECK_EQ(i_isolate_->thread_id(), i::ThreadId::Current());
-    streaming_decoder_->Finish(caching_callback);
+    // Hold a local reference in case the embedder destroys `WasmStreaming`
+    // inside `caching_callback` or `OnCompilationSucceeded`.
+    std::shared_ptr<i::wasm::StreamingDecoder> streaming_decoder =
+        streaming_decoder_;
+    streaming_decoder->Finish(caching_callback);
   }
 
   void Abort(i::MaybeHandle<i::JSAny> exception) {
@@ -111,7 +114,7 @@ class WasmStreaming::WasmStreamingImpl {
     streaming_decoder_->SetHasCompiledModuleBytes();
   }
 
-  void SetUrl(base::Vector<const char> url) { streaming_decoder_->SetUrl(url); }
+  void SetUrl(std::string_view url) { streaming_decoder_->SetUrl(url); }
 
  private:
   i::Isolate* const i_isolate_;
@@ -161,7 +164,7 @@ void WasmStreaming::SetMoreFunctionsCanBeSerializedCallback(
 void WasmStreaming::SetUrl(const char* url, size_t length) {
   DCHECK_EQ('\0', url[length]);  // {url} is null-terminated.
   TRACE_EVENT("v8.wasm", "wasm.SetUrl", "url", url);
-  impl_->SetUrl(base::VectorOf(url, length));
+  impl_->SetUrl(std::string_view(url, length));
 }
 
 // static
@@ -193,9 +196,14 @@ class WasmModuleCompilation::Impl {
     DCHECK_NULL(resolver_->callback_);
     resolver_->callback_ = resolution_callback;
 
-    streaming_decoder_->InitializeIsolateSpecificInfo(
+    // Hold a local reference in case the embedder destroys
+    // `WasmModuleCompilation` inside `caching_callback` or
+    // `resolution_callback`.
+    std::shared_ptr<i::wasm::StreamingDecoder> streaming_decoder =
+        streaming_decoder_;
+    streaming_decoder->InitializeIsolateSpecificInfo(
         reinterpret_cast<i::Isolate*>(isolate));
-    streaming_decoder_->Finish(caching_callback);
+    streaming_decoder->Finish(caching_callback);
   }
 
   void Abort() { streaming_decoder_->Abort(); }
@@ -214,7 +222,7 @@ class WasmModuleCompilation::Impl {
     streaming_decoder_->SetHasCompiledModuleBytes();
   }
 
-  void SetUrl(base::Vector<const char> url) { streaming_decoder_->SetUrl(url); }
+  void SetUrl(std::string_view url) { streaming_decoder_->SetUrl(url); }
 
  private:
   class Resolver final : public i::wasm::CompilationResultResolver {
@@ -247,8 +255,7 @@ WasmModuleCompilation::WasmModuleCompilation(const CompileOptions& options)
           i::wasm::CompileTimeImportsFromOptions(options))) {
   TRACE_EVENT("v8.wasm", "wasm.ModuleCompilation");
   if (!options.source_url.empty()) {
-    impl_->SetUrl(
-        base::VectorOf(options.source_url.data(), options.source_url.size()));
+    impl_->SetUrl(options.source_url);
   }
 }
 
@@ -284,7 +291,7 @@ void WasmModuleCompilation::SetMoreFunctionsCanBeSerializedCallback(
 void WasmModuleCompilation::SetUrl(const char* url, size_t length) {
   DCHECK_EQ('\0', url[length]);  // {url} is null-terminated.
   TRACE_EVENT("v8.wasm", "wasm.SetUrl", "url", url);
-  impl_->SetUrl(base::VectorOf(url, length));
+  impl_->SetUrl(std::string_view(url, length));
 }
 
 namespace {
@@ -329,9 +336,9 @@ base::UniqueArray<const uint8_t> GetAndCopyFirstArgumentAsBytes(
   } else if (source->IsTypedArray()) {
     // A TypedArray was passed.
     Local<TypedArray> array = Local<TypedArray>::Cast(source);
-    Local<ArrayBuffer> buffer = array->Buffer();
+    Local<ArrayBufferBase> buffer = array->GetBuffer();
 
-    auto backing_store = buffer->GetBackingStore();
+    std::shared_ptr<v8::BackingStore> backing_store = buffer->GetBackingStore();
 
     start = reinterpret_cast<const uint8_t*>(backing_store->Data()) +
             array->ByteOffset();
@@ -943,8 +950,7 @@ void WebAssemblyValidateImpl(const v8::FunctionCallbackInfo<v8::Value>& info) {
   }
 
   bool validated = i::wasm::GetWasmEngine()->SyncValidate(
-      i_isolate, enabled_features, std::move(compile_imports),
-      bytes.as_vector());
+      i_isolate, enabled_features, std::move(compile_imports), bytes.as_span());
 
   return_value.Set(validated);
 }
@@ -973,7 +979,13 @@ bool TransferPrototype(i::Isolate* isolate,
 void WebAssemblyModuleImpl(const v8::FunctionCallbackInfo<v8::Value>& info) {
   WasmJSApiScope js_api_scope{info, "WebAssembly.Module()"};
   auto [isolate, i_isolate, thrower] = js_api_scope.isolates_and_thrower();
-  if (i_isolate->wasm_module_callback()(info)) return;
+  if (WasmModuleCallback callback = i_isolate->wasm_module_callback()) {
+    if (callback(isolate, info[0])) return;
+  }
+  if (ExtensionCallback callback =
+          i_isolate->deprecated_wasm_module_callback()) {
+    if (callback(info)) return;
+  }
   RecordCompilationMethod(i_isolate, kSyncCompilation);
 
   if (!info.IsConstructCall()) {
@@ -1090,7 +1102,13 @@ void WebAssemblyInstanceImpl(const v8::FunctionCallbackInfo<v8::Value>& info) {
   i_isolate->CountUsage(
       v8::Isolate::UseCounterFeature::kWebAssemblyInstantiation);
 
-  if (i_isolate->wasm_instance_callback()(info)) return;
+  if (WasmInstanceCallback callback = i_isolate->wasm_instance_callback()) {
+    if (callback(isolate, info[0])) return;
+  }
+  if (ExtensionCallback callback =
+          i_isolate->deprecated_wasm_instance_callback()) {
+    if (callback(info)) return;
+  }
 
   i::DirectHandle<i::JSObject> instance_obj;
   {
@@ -2479,7 +2497,8 @@ V8_WARN_UNUSED_RESULT bool WasmObjectToJSReturnValue(
     thrower->TypeError("invalid type %s", unsafe_type.name().c_str());
     return false;
   }
-  return_value.Set(Utils::ToLocal(i::wasm::WasmToJSObject(isolate, value)));
+  return_value.Set(Utils::ToLocal(
+      i::wasm::WasmToJSObject(isolate, value, i::wasm::kUnshareStrings)));
   return true;
 }
 }  // namespace
@@ -3324,8 +3343,7 @@ void WasmJs::PrepareForSnapshot(Isolate* isolate) {
 
   // By default, make all exported functions an instance of {Function}.
   {
-    DirectHandle<Map> function_map =
-        isolate->sloppy_function_without_prototype_map();
+    DirectHandle<Map> function_map = isolate->function_without_prototype_map();
     native_context->set_wasm_exported_function_map(*function_map);
   }
 
@@ -3592,11 +3610,6 @@ CompileTimeImports CompileTimeImportsFromOptions(
     result.constants_module() = options.imported_string_constants_module;
     result.Add(CompileTimeImport::kStringConstants);
   }
-  // Mirror the JS `WebAssembly.Module` constructor, which disables denormal
-  // floats at compile time when the host FPU flushes them.
-  if (base::FPU::GetFlushDenormals()) {
-    result.Add(CompileTimeImport::kDisableDenormalFloats);
-  }
   return result;
 }
 }  // namespace wasm
@@ -3606,9 +3619,6 @@ CompileTimeImports WasmJs::CompileTimeImportsFromArgument(
     DirectHandle<Object> arg, Isolate* isolate,
     WasmEnabledFeatures enabled_features) {
   CompileTimeImports result;
-  if (base::FPU::GetFlushDenormals()) {
-    result.Add(CompileTimeImport::kDisableDenormalFloats);
-  }
   if (!IsJSReceiver(*arg)) return result;
   DirectHandle<JSReceiver> receiver = Cast<JSReceiver>(arg);
 

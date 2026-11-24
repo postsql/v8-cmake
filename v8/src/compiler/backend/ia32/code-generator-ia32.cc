@@ -1099,8 +1099,8 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       }
       break;
     }
-    case kArchStoreIndirectSkippedWriteBarrier:
-    case kArchStoreIndirectWithWriteBarrier:
+    case kArchStoreTrustedSkippedWriteBarrier:
+    case kArchStoreTrustedWithWriteBarrier:
       UNREACHABLE();
     case kArchStackSlot: {
       FrameOffset offset =
@@ -1616,9 +1616,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kFloat32Div: {
       __ Divss(i.OutputDoubleRegister(), i.InputDoubleRegister(0),
                i.InputOperand(1));
-      // Don't delete this mov. It may improve performance on some CPUs,
-      // when there is a (v)mulss depending on the result.
-      __ movaps(i.OutputDoubleRegister(), i.OutputDoubleRegister());
       break;
     }
     case kFloat64Add: {
@@ -1639,9 +1636,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kFloat64Div: {
       __ Divsd(i.OutputDoubleRegister(), i.InputDoubleRegister(0),
                i.InputOperand(1));
-      // Don't delete this mov. It may improve performance on some CPUs,
-      // when there is a (v)mulsd depending on the result.
-      __ movaps(i.OutputDoubleRegister(), i.OutputDoubleRegister());
       break;
     }
     case kFloat32Abs: {
@@ -4460,7 +4454,8 @@ void CodeGenerator::Pop(InstructionOperand* dest, MachineRepresentation rep) {
   if (dest->IsRegister()) {
     frame_access_state()->IncreaseSPDelta(-dropped_slots);
     __ pop(g.ToRegister(dest));
-  } else if (dest->IsStackSlot() || dest->IsFloatStackSlot()) {
+  } else if ((dest->IsStackSlot() || dest->IsFloatStackSlot()) &&
+             dropped_slots == 1) {
     frame_access_state()->IncreaseSPDelta(-dropped_slots);
     __ pop(g.ToOperand(dest));
   } else {
@@ -4471,6 +4466,7 @@ void CodeGenerator::Pop(InstructionOperand* dest, MachineRepresentation rep) {
     __ add(esp, Immediate(dropped_slots * kSystemPointerSize));
   }
   temp_slots_ -= dropped_slots;
+  DCHECK_GE(temp_slots_, 0);
 }
 
 void CodeGenerator::PopTempStackSlots() {
@@ -4542,8 +4538,13 @@ void CodeGenerator::AssembleMove(InstructionOperand* source,
       } else {
         DCHECK(source->IsFPRegister());
         XMMRegister src = g.ToDoubleRegister(source);
-        MachineRepresentation rep =
+        MachineRepresentation src_rep =
             LocationOperand::cast(source)->representation();
+        MachineRepresentation dst_rep =
+            LocationOperand::cast(destination)->representation();
+        MachineRepresentation rep =
+            ElementSizeInBytes(dst_rep) < ElementSizeInBytes(src_rep) ? dst_rep
+                                                                      : src_rep;
         if (rep == MachineRepresentation::kFloat32) {
           __ Movss(dst, src);
         } else if (rep == MachineRepresentation::kFloat64) {
@@ -4582,8 +4583,13 @@ void CodeGenerator::AssembleMove(InstructionOperand* source,
         __ push(src);
         __ pop(dst);
       } else {
-        MachineRepresentation rep =
+        MachineRepresentation src_rep =
             LocationOperand::cast(source)->representation();
+        MachineRepresentation dst_rep =
+            LocationOperand::cast(destination)->representation();
+        MachineRepresentation rep =
+            ElementSizeInBytes(dst_rep) < ElementSizeInBytes(src_rep) ? dst_rep
+                                                                      : src_rep;
         if (rep == MachineRepresentation::kFloat32) {
           __ Movss(kScratchDoubleReg, src);
           __ Movss(dst, kScratchDoubleReg);

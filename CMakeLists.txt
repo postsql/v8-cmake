@@ -324,6 +324,7 @@ list(APPEND i18n-sources
   v8/src/objects/js-locale.cc
   v8/src/objects/js-number-format.cc
   v8/src/objects/js-plural-rules.cc
+  v8/src/objects/js-plural-rules-internal.cc
   v8/src/objects/js-relative-time-format.cc
   v8/src/objects/js-segment-iterator.cc
   v8/src/objects/js-segmenter.cc
@@ -338,7 +339,7 @@ target_compile_options(v8-i18n-support PRIVATE ${disable-exceptions} ${v8_warnin
 if(enable-fPIC)
   target_compile_options(v8-i18n-support PRIVATE ${enable-fpic})
 endif()
-target_link_libraries(v8-i18n-support PRIVATE v8_torque_generated v8_libbase)
+target_link_libraries(v8-i18n-support PRIVATE v8_torque_generated v8_libbase v8-bytecodes-builtin-list)
 
 target_include_directories(v8-i18n-support
   PRIVATE
@@ -1077,7 +1078,6 @@ add_library(v8_libbase STATIC
   v8/src/base/division-by-constant.cc
   v8/src/base/emulated-virtual-address-subspace.cc
   v8/src/base/file-utils.cc
-  v8/src/base/fpu.cc
   v8/src/base/ieee754.cc
   v8/src/base/logging.cc
   ${base-numbers-sources}

@@ -15,6 +15,7 @@
 #include "src/compiler/backend/instruction.h"
 #include "src/compiler/linkage.h"
 #include "src/execution/isolate.h"
+#include "src/execution/simulator.h"
 #include "src/objects/heap-number-inl.h"
 #include "src/objects/object-conversions-inl.h"
 #include "src/objects/objects-inl.h"
@@ -1126,10 +1127,10 @@ constexpr int TestEnvironment::kDoubleConstantCount;
 class CodeGeneratorTester {
  public:
   explicit CodeGeneratorTester(TestEnvironment* environment,
-                               int extra_stack_space = 0)
+                               int extra_stack_space = 0,
+                               int scratch_spill_slots = 0)
       : zone_(environment->main_zone()),
-        info_(base::ArrayVector("test"), environment->main_zone(),
-              CodeKind::FOR_TESTING),
+        info_("test", environment->main_zone(), CodeKind::FOR_TESTING),
         linkage_(environment->test_descriptor()),
         frame_(environment->test_descriptor()->CalculateFixedFrameSize(
                    CodeKind::FOR_TESTING),
@@ -1160,6 +1161,11 @@ class CodeGeneratorTester {
         spill_slots_.emplace_back(old_slot, new_slot);
         i++;
       }
+    }
+    if (scratch_spill_slots > 0) {
+      int end_slot = frame_.AllocateSpillSlot(
+          scratch_spill_slots * kSystemPointerSize, kSimd128Size);
+      first_scratch_spill_slot_ = end_slot - scratch_spill_slots + 1;
     }
 
     constexpr size_t kMaxUnoptimizedFrameHeight = 0;
@@ -1342,6 +1348,8 @@ class CodeGeneratorTester {
     return Finalize();
   }
 
+  int first_scratch_spill_slot() const { return first_scratch_spill_slot_; }
+
  private:
   Zone* zone_;
   OptimizedCompilationInfo info_;
@@ -1350,6 +1358,7 @@ class CodeGeneratorTester {
   CodeGenerator* generator_;
   // List of operands to be moved from stack parameters to spill slots.
   std::vector<std::pair<LocationOperand, LocationOperand>> spill_slots_;
+  int first_scratch_spill_slot_ = 0;
 };
 
 // The following fuzz tests will assemble a lot of moves, wrap them in
@@ -1639,6 +1648,54 @@ TEST(AssembleTailCallGap) {
   }
 }
 
+TEST(PopTempStackSlots) {
+  if (kSystemPointerSize == 8 && !TestSimd128Moves()) return;
+
+  constexpr MachineRepresentation kTwoSlotRep =
+      kSystemPointerSize == 8 ? MachineRepresentation::kSimd128
+                              : MachineRepresentation::kFloat64;
+
+  TestEnvironment env;
+  Handle<FixedArray> state_in = env.GenerateInitialState();
+
+  // Test both a small number of temporary stack slots and a larger count whose
+  // byte size exceeds 4095 and is not a multiple of 4096.
+  for (int num_cycles : {4, 260}) {
+    const int scratch_slots = num_cycles * 4;
+    CodeGeneratorTester c(&env, 0, scratch_slots);
+    ParallelMove* moves = env.main_zone()->New<ParallelMove>(env.main_zone());
+
+    for (int i = 0; i < num_cycles; i++) {
+      int base = c.first_scratch_spill_slot() + i * 4;
+      AllocatedOperand pair_lo(LocationOperand::STACK_SLOT, kTwoSlotRep,
+                               base + 1);
+      AllocatedOperand pair_hi(LocationOperand::STACK_SLOT, kTwoSlotRep,
+                               base + 3);
+      AllocatedOperand slot_0(LocationOperand::STACK_SLOT,
+                              MachineRepresentation::kTagged, base + 0);
+      AllocatedOperand slot_1(LocationOperand::STACK_SLOT,
+                              MachineRepresentation::kTagged, base + 1);
+      AllocatedOperand slot_2(LocationOperand::STACK_SLOT,
+                              MachineRepresentation::kTagged, base + 2);
+      AllocatedOperand slot_3(LocationOperand::STACK_SLOT,
+                              MachineRepresentation::kTagged, base + 3);
+      moves->AddMove(pair_lo, pair_hi);
+      moves->AddMove(slot_2, slot_0);
+      moves->AddMove(slot_3, slot_1);
+    }
+
+    c.CheckAssembleMoves(moves);
+
+    Handle<Code> test = c.FinalizeForExecuting();
+    if (v8_flags.print_code) {
+      Print(*test);
+    }
+
+    DirectHandle<FixedArray> actual = env.Run(test, state_in);
+    env.CheckState(actual, state_in);
+  }
+}
+
 #if V8_TARGET_ARCH_X64
 TEST(TurboFanFrameSlotAlignment) {
   TestEnvironment env;
@@ -1658,8 +1715,7 @@ TEST(TurboFanFrameSlotAlignment) {
         }
         frame.EnsureReturnSlots(return_slots);
 
-        OptimizedCompilationInfo info(base::ArrayVector("test"), &zone,
-                                      CodeKind::FOR_TESTING);
+        OptimizedCompilationInfo info("test", &zone, CodeKind::FOR_TESTING);
         CodeGenerator codegen(
             &zone, &frame, &linkage, env.instructions(), &info, isolate,
             std::optional<OsrHelper>(), kNoSourcePosition, nullptr,
@@ -1681,6 +1737,474 @@ TEST(TurboFanFrameSlotAlignment) {
   }
 }
 #endif
+
+#if V8_TARGET_ARCH_IA32 || V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64
+TEST(GapMoveCycleMixedRep) {
+  enum class CycleKind {
+    kRegDstWithStackTemp,
+    kStackDstWithStackTemp,
+    kStackDstWithScratchReg,
+    kMixedStackToStack,
+    kMixedStackToReg,
+    kMixedTwoMoveCycle,
+  };
+
+#if V8_TARGET_ARCH_64_BIT
+  static constexpr intptr_t kCanary0 =
+      static_cast<intptr_t>(0x123456789ABCDEF0ULL);
+  static constexpr intptr_t kCanary1 =
+      static_cast<intptr_t>(0x23456789ABCDEF01ULL);
+  static constexpr intptr_t kCanary2 =
+      static_cast<intptr_t>(0x3456789ABCDEF012ULL);
+  static constexpr intptr_t kPayload =
+      static_cast<intptr_t>(0x5555555555555555ULL);
+  static constexpr intptr_t kPayload2 =
+      static_cast<intptr_t>(0x6666666666666666ULL);
+#else
+  static constexpr intptr_t kCanary0 = static_cast<intptr_t>(0x12345678U);
+  static constexpr intptr_t kCanary1 = static_cast<intptr_t>(0x23456789U);
+  static constexpr intptr_t kCanary2 = static_cast<intptr_t>(0x3456789AU);
+  static constexpr intptr_t kPayload = static_cast<intptr_t>(0x55555555U);
+  static constexpr intptr_t kPayload2 = static_cast<intptr_t>(0x66666666U);
+#endif
+
+  HandleAndZoneScope scope;
+  Isolate* isolate = scope.main_isolate();
+
+  auto RunCycleCheck = [isolate](MachineRepresentation src_rep,
+                                 MachineRepresentation dst_rep, CycleKind kind,
+                                 int check_slot_idx) {
+    HandleScope handles(isolate);
+    Zone local_zone(isolate->allocator(), ZONE_NAME);
+    Zone* zone = &local_zone;
+
+    MachineSignature::Builder sig_builder(zone, 1, 0);
+    sig_builder.AddReturn(MachineType::IntPtr());
+    CallDescriptor* desc = Linkage::GetSimplifiedCDescriptor(
+        zone, sig_builder.Get(), CallDescriptor::kInitializeRootRegister);
+    Linkage linkage(desc);
+
+    ZoneVector<InstructionBlock*> blocks(zone);
+    InstructionBlock* block = zone->New<InstructionBlock>(
+        zone, RpoNumber::FromInt(0), RpoNumber::Invalid(), RpoNumber::Invalid(),
+        RpoNumber::Invalid(), false, false);
+    block->mark_needs_frame();
+    block->mark_must_construct_frame();
+    blocks.push_back(block);
+
+    InstructionSequence sequence(isolate, zone, &blocks);
+    Frame frame(desc->CalculateFixedFrameSize(CodeKind::FOR_TESTING), zone);
+
+    // Bracket s1 and s2 with canary slots. Multi-slot stores grow toward
+    // smaller slot indices (higher addresses), so an over-wide store into
+    // narrow s2_dst overwrites pad_slot1.
+    const int s2_bytes =
+        std::max(kSystemPointerSize, ElementSizeInBytes(dst_rep));
+    int pad_slot0 = frame.AllocateSpillSlot(kSystemPointerSize);
+    int s1_index = frame.AllocateSpillSlot(kSimd128Size);
+    int pad_slot1 = frame.AllocateSpillSlot(kSystemPointerSize);
+    int s2_index = frame.AllocateSpillSlot(s2_bytes);
+    int pad_slot2 = frame.AllocateSpillSlot(kSystemPointerSize);
+
+    const int s1_slots = kSimd128Size / kSystemPointerSize;
+    const int s2_slots = s2_bytes / kSystemPointerSize;
+    const int s1_hi_slot = s1_index - s1_slots + 1;
+
+    const RegisterConfiguration* config = RegisterConfiguration::Default();
+    BitVector* allocated_regs =
+        zone->New<BitVector>(config->num_general_registers(), zone);
+    for (Register reg : desc->CalleeSavedRegisters()) {
+      if (config->IsAllocatableGeneralCode(reg.code())) {
+        allocated_regs->Add(reg.code());
+        break;
+      }
+    }
+    frame.SetAllocatedRegisters(allocated_regs);
+
+    BitVector* allocated_double_regs =
+        zone->New<BitVector>(config->num_double_registers(), zone);
+    allocated_double_regs->Add(config->GetAllocatableDoubleCode(0));
+    allocated_double_regs->Add(config->GetAllocatableDoubleCode(1));
+    frame.SetAllocatedDoubleRegisters(allocated_double_regs);
+
+    sequence.StartBlock(RpoNumber::FromInt(0));
+
+    auto AddPtrConstant = [&](intptr_t val) {
+      int vreg = sequence.NextVirtualRegister();
+#if V8_TARGET_ARCH_64_BIT
+      sequence.AddConstant(vreg, Constant(static_cast<int64_t>(val)));
+#else
+      sequence.AddConstant(vreg, Constant(static_cast<int32_t>(val)));
+#endif
+      return ConstantOperand(vreg);
+    };
+
+    ConstantOperand canary0_op = AddPtrConstant(kCanary0);
+    ConstantOperand canary1_op = AddPtrConstant(kCanary1);
+    ConstantOperand canary2_op = AddPtrConstant(kCanary2);
+    ConstantOperand payload_op = AddPtrConstant(kPayload);
+    ConstantOperand payload2_op = AddPtrConstant(kPayload2);
+
+    int zero_fp_vreg = sequence.NextVirtualRegister();
+    sequence.AddConstant(zero_fp_vreg, Constant(0.0));
+
+    AllocatedOperand fp0_s128(LocationOperand::REGISTER,
+                              MachineRepresentation::kSimd128,
+                              config->GetAllocatableDoubleCode(0));
+    AllocatedOperand fp0_src(LocationOperand::REGISTER, src_rep,
+                             config->GetAllocatableDoubleCode(0));
+    AllocatedOperand fp1_f64(LocationOperand::REGISTER,
+                             MachineRepresentation::kFloat64,
+                             config->GetAllocatableDoubleCode(1));
+    AllocatedOperand fp1_s128(LocationOperand::REGISTER,
+                              MachineRepresentation::kSimd128,
+                              config->GetAllocatableDoubleCode(1));
+    AllocatedOperand fp1_dst(LocationOperand::REGISTER, dst_rep,
+                             config->GetAllocatableDoubleCode(1));
+    AllocatedOperand s1_op(LocationOperand::STACK_SLOT,
+                           MachineRepresentation::kSimd128, s1_index);
+    AllocatedOperand s2_dst(LocationOperand::STACK_SLOT, dst_rep, s2_index);
+
+    Instruction* init_nop = Instruction::New(zone, kArchNop);
+    ParallelMove* init_moves =
+        init_nop->GetOrCreateParallelMove(Instruction::START, zone);
+    init_moves->AddMove(
+        canary0_op,
+        AllocatedOperand(LocationOperand::STACK_SLOT,
+                         MachineType::PointerRepresentation(), pad_slot0));
+    init_moves->AddMove(
+        canary1_op,
+        AllocatedOperand(LocationOperand::STACK_SLOT,
+                         MachineType::PointerRepresentation(), pad_slot1));
+    init_moves->AddMove(
+        canary2_op,
+        AllocatedOperand(LocationOperand::STACK_SLOT,
+                         MachineType::PointerRepresentation(), pad_slot2));
+    for (int i = 0; i < s1_slots; ++i) {
+      init_moves->AddMove(
+          payload_op,
+          AllocatedOperand(LocationOperand::STACK_SLOT,
+                           MachineType::PointerRepresentation(), s1_index - i));
+    }
+    for (int i = 0; i < s2_slots; ++i) {
+      init_moves->AddMove(
+          payload2_op,
+          AllocatedOperand(LocationOperand::STACK_SLOT,
+                           MachineType::PointerRepresentation(), s2_index - i));
+    }
+    init_moves->AddMove(ConstantOperand(zero_fp_vreg), fp1_f64);
+
+    ParallelMove* init_fp0 =
+        init_nop->GetOrCreateParallelMove(Instruction::END, zone);
+    init_fp0->AddMove(s1_op, fp0_s128);
+    sequence.AddInstruction(init_nop);
+
+    Instruction* cycle_nop = Instruction::New(zone, kArchNop);
+    ParallelMove* cycle_moves =
+        cycle_nop->GetOrCreateParallelMove(Instruction::START, zone);
+    switch (kind) {
+      case CycleKind::kRegDstWithStackTemp:
+        cycle_moves->AddMove(s1_op, fp0_s128);
+        cycle_moves->AddMove(s2_dst, s1_op);
+        cycle_moves->AddMove(fp1_s128, s2_dst);
+        cycle_moves->AddMove(fp0_src, fp1_dst);
+        break;
+      case CycleKind::kStackDstWithStackTemp:
+        cycle_moves->AddMove(s1_op, fp0_s128);
+        cycle_moves->AddMove(s2_dst, s1_op);
+        cycle_moves->AddMove(fp0_src, s2_dst);
+        break;
+      case CycleKind::kStackDstWithScratchReg:
+        cycle_moves->AddMove(fp1_s128, fp0_s128);
+        cycle_moves->AddMove(s2_dst, fp1_s128);
+        cycle_moves->AddMove(fp0_src, s2_dst);
+        break;
+      case CycleKind::kMixedStackToStack:
+        cycle_moves->AddMove(s2_dst, fp0_s128);
+        cycle_moves->AddMove(s1_op, s2_dst);
+        cycle_moves->AddMove(fp0_src, s1_op);
+        break;
+      case CycleKind::kMixedStackToReg:
+        cycle_moves->AddMove(s1_op, fp1_dst);
+        cycle_moves->AddMove(fp0_src, s1_op);
+        cycle_moves->AddMove(fp1_s128, fp0_s128);
+        break;
+      case CycleKind::kMixedTwoMoveCycle:
+        cycle_moves->AddMove(s2_dst, fp0_src);
+        cycle_moves->AddMove(fp0_src, s2_dst);
+        break;
+    }
+
+    if (check_slot_idx == 3) {
+      ParallelMove* spill_fp1 =
+          cycle_nop->GetOrCreateParallelMove(Instruction::END, zone);
+      spill_fp1->AddMove(fp1_s128, s1_op);
+    }
+    sequence.AddInstruction(cycle_nop);
+
+    const std::pair<int, intptr_t> checks[] = {
+        {pad_slot0, kCanary0},
+        {pad_slot1, kCanary1},
+        {pad_slot2, kCanary2},
+        {s1_hi_slot, kPayload},
+    };
+    const auto [slot_to_read, expected_val] = checks[check_slot_idx];
+
+    InstructionOperand ret_inputs[] = {
+        ImmediateOperand(ImmediateOperand::INLINE_INT32, 0),
+        AllocatedOperand(LocationOperand::REGISTER,
+                         MachineType::PointerRepresentation(),
+                         kReturnRegister0.code())};
+    Instruction* ret_instr =
+        Instruction::New(zone, kArchRet, 0, nullptr, arraysize(ret_inputs),
+                         ret_inputs, 0, nullptr);
+    ParallelMove* pre_ret =
+        ret_instr->GetOrCreateParallelMove(Instruction::START, zone);
+    pre_ret->AddMove(
+        AllocatedOperand(LocationOperand::STACK_SLOT,
+                         MachineType::PointerRepresentation(), slot_to_read),
+        AllocatedOperand(LocationOperand::REGISTER,
+                         MachineType::PointerRepresentation(),
+                         kReturnRegister0.code()));
+
+    sequence.AddInstruction(ret_instr);
+    sequence.EndBlock(RpoNumber::FromInt(0));
+
+    OptimizedCompilationInfo info("gap_cycle_mixed_rep", zone,
+                                  CodeKind::FOR_TESTING);
+    CodeGenerator codegen(zone, &frame, &linkage, &sequence, &info, isolate,
+                          std::optional<OsrHelper>(), kNoSourcePosition,
+                          nullptr, AssemblerOptions::Default(isolate),
+                          Builtin::kNoBuiltinId, 0, 0);
+    codegen.AssembleCode();
+    DirectHandle<Code> code = codegen.FinalizeCode().ToHandleChecked();
+    auto fn = GeneratedCode<intptr_t>::FromCode(isolate, *code);
+    CHECK_EQ(expected_val, fn.Call());
+  };
+
+  auto RunCycleTest = [&](MachineRepresentation src_rep,
+                          MachineRepresentation dst_rep, CycleKind kind) {
+    const bool check_fp1_upper = kind == CycleKind::kMixedStackToReg ||
+                                 (kind == CycleKind::kRegDstWithStackTemp &&
+                                  src_rep == MachineRepresentation::kSimd128);
+    const int num_checks = check_fp1_upper ? 4 : 3;
+    for (int i = 0; i < num_checks; ++i) {
+      RunCycleCheck(src_rep, dst_rep, kind, i);
+    }
+  };
+
+  for (CycleKind kind :
+       {CycleKind::kRegDstWithStackTemp, CycleKind::kStackDstWithStackTemp,
+        CycleKind::kStackDstWithScratchReg, CycleKind::kMixedStackToStack,
+        CycleKind::kMixedStackToReg, CycleKind::kMixedTwoMoveCycle}) {
+    // Narrower source to wider destination (f32 -> s128, f64 -> s128).
+    RunCycleTest(MachineRepresentation::kFloat32,
+                 MachineRepresentation::kSimd128, kind);
+    RunCycleTest(MachineRepresentation::kFloat64,
+                 MachineRepresentation::kSimd128, kind);
+    // Wider source to narrower destination (s128 -> f32, s128 -> f64).
+    RunCycleTest(MachineRepresentation::kSimd128,
+                 MachineRepresentation::kFloat32, kind);
+    RunCycleTest(MachineRepresentation::kSimd128,
+                 MachineRepresentation::kFloat64, kind);
+    // Same representation baseline (s128 -> s128).
+    RunCycleTest(MachineRepresentation::kSimd128,
+                 MachineRepresentation::kSimd128, kind);
+  }
+}
+#endif
+
+#if V8_TARGET_ARCH_64_BIT
+TEST(GapMoveCycleMixedGpRep) {
+  enum class CycleKind {
+    kRegToRegWithScratchReg,
+    kRegToRegWithStackTemp,
+    kStackToRegWithScratchReg,
+  };
+
+  HandleAndZoneScope scope;
+  Isolate* isolate = scope.main_isolate();
+
+  auto RunCycleCheck = [isolate](MachineRepresentation src_rep,
+                                 MachineRepresentation dst_rep, CycleKind kind,
+                                 uint64_t payload) {
+    HandleScope handles(isolate);
+    Zone local_zone(isolate->allocator(), ZONE_NAME);
+    Zone* zone = &local_zone;
+
+    MachineSignature::Builder sig_builder(zone, 1, 0);
+    sig_builder.AddReturn(MachineType::Uint64());
+    CallDescriptor* desc = Linkage::GetSimplifiedCDescriptor(
+        zone, sig_builder.Get(), CallDescriptor::kInitializeRootRegister);
+    Linkage linkage(desc);
+
+    ZoneVector<InstructionBlock*> blocks(zone);
+    InstructionBlock* block = zone->New<InstructionBlock>(
+        zone, RpoNumber::FromInt(0), RpoNumber::Invalid(), RpoNumber::Invalid(),
+        RpoNumber::Invalid(), false, false);
+    block->mark_needs_frame();
+    block->mark_must_construct_frame();
+    blocks.push_back(block);
+
+    InstructionSequence sequence(isolate, zone, &blocks);
+    Frame frame(desc->CalculateFixedFrameSize(CodeKind::FOR_TESTING), zone);
+
+    int s0_index = frame.AllocateSpillSlot(kSystemPointerSize);
+    int s1_index = frame.AllocateSpillSlot(kSystemPointerSize);
+
+    const RegisterConfiguration* config = RegisterConfiguration::Default();
+    int r0_code = -1;
+    int r1_code = -1;
+    for (int i = 0; i < config->num_allocatable_general_registers(); ++i) {
+      int code = config->GetAllocatableGeneralCode(i);
+      if (code == kReturnRegister0.code()) continue;
+      if (r0_code == -1) {
+        r0_code = code;
+      } else {
+        r1_code = code;
+        break;
+      }
+    }
+    CHECK_NE(r0_code, -1);
+    CHECK_NE(r1_code, -1);
+
+    BitVector* allocated_regs =
+        zone->New<BitVector>(config->num_general_registers(), zone);
+    allocated_regs->Add(r0_code);
+    allocated_regs->Add(r1_code);
+    for (Register reg : desc->CalleeSavedRegisters()) {
+      if (config->IsAllocatableGeneralCode(reg.code())) {
+        allocated_regs->Add(reg.code());
+        break;
+      }
+    }
+    frame.SetAllocatedRegisters(allocated_regs);
+    frame.SetAllocatedDoubleRegisters(
+        zone->New<BitVector>(config->num_double_registers(), zone));
+
+    sequence.StartBlock(RpoNumber::FromInt(0));
+
+    auto AddU64Constant = [&](uint64_t val) {
+      int vreg = sequence.NextVirtualRegister();
+      sequence.AddConstant(vreg, Constant(static_cast<int64_t>(val)));
+      return ConstantOperand(vreg);
+    };
+
+    ConstantOperand payload_op = AddU64Constant(payload);
+    ConstantOperand other0_op = AddU64Constant(0x1122334455667788ULL);
+    ConstantOperand other1_op = AddU64Constant(0x99AABBCCDDEEFF00ULL);
+    ConstantOperand other2_op = AddU64Constant(0x2468ACE013579BDFULL);
+
+    AllocatedOperand r0_w64(LocationOperand::REGISTER,
+                            MachineRepresentation::kWord64, r0_code);
+    AllocatedOperand r0_src(LocationOperand::REGISTER, src_rep, r0_code);
+    AllocatedOperand r1_w64(LocationOperand::REGISTER,
+                            MachineRepresentation::kWord64, r1_code);
+    AllocatedOperand r1_dst(LocationOperand::REGISTER, dst_rep, r1_code);
+    AllocatedOperand s0_w64(LocationOperand::STACK_SLOT,
+                            MachineRepresentation::kWord64, s0_index);
+    AllocatedOperand s0_src(LocationOperand::STACK_SLOT, src_rep, s0_index);
+    AllocatedOperand s1_w64(LocationOperand::STACK_SLOT,
+                            MachineRepresentation::kWord64, s1_index);
+
+    Instruction* init_nop = Instruction::New(zone, kArchNop);
+    ParallelMove* init_moves =
+        init_nop->GetOrCreateParallelMove(Instruction::START, zone);
+    if (kind == CycleKind::kStackToRegWithScratchReg) {
+      init_moves->AddMove(payload_op, s0_w64);
+      init_moves->AddMove(other0_op, r0_w64);
+    } else {
+      init_moves->AddMove(payload_op, r0_w64);
+      init_moves->AddMove(other0_op, s0_w64);
+    }
+    init_moves->AddMove(other1_op, r1_w64);
+    init_moves->AddMove(other2_op, s1_w64);
+    sequence.AddInstruction(init_nop);
+
+    Instruction* cycle_nop = Instruction::New(zone, kArchNop);
+    ParallelMove* cycle_moves =
+        cycle_nop->GetOrCreateParallelMove(Instruction::START, zone);
+    // Order each cycle so that the mixed-width move into r1_dst is the direct
+    // blocker of cycle_moves[0] and therefore becomes cycle.back() in
+    // GapResolver::PerformCycle.
+    switch (kind) {
+      case CycleKind::kRegToRegWithScratchReg:
+        cycle_moves->AddMove(r1_w64, r0_w64);
+        cycle_moves->AddMove(r0_src, r1_dst);
+        break;
+      case CycleKind::kRegToRegWithStackTemp:
+        cycle_moves->AddMove(s1_w64, r0_w64);
+        cycle_moves->AddMove(s0_w64, s1_w64);
+        cycle_moves->AddMove(r1_w64, s0_w64);
+        cycle_moves->AddMove(r0_src, r1_dst);
+        break;
+      case CycleKind::kStackToRegWithScratchReg:
+        cycle_moves->AddMove(r1_w64, s0_w64);
+        cycle_moves->AddMove(s0_src, r1_dst);
+        break;
+    }
+    sequence.AddInstruction(cycle_nop);
+
+    InstructionOperand ret_inputs[] = {
+        ImmediateOperand(ImmediateOperand::INLINE_INT32, 0),
+        AllocatedOperand(LocationOperand::REGISTER,
+                         MachineRepresentation::kWord64,
+                         kReturnRegister0.code())};
+    Instruction* ret_instr =
+        Instruction::New(zone, kArchRet, 0, nullptr, arraysize(ret_inputs),
+                         ret_inputs, 0, nullptr);
+    ParallelMove* pre_ret =
+        ret_instr->GetOrCreateParallelMove(Instruction::START, zone);
+    pre_ret->AddMove(r1_w64, AllocatedOperand(LocationOperand::REGISTER,
+                                              MachineRepresentation::kWord64,
+                                              kReturnRegister0.code()));
+
+    sequence.AddInstruction(ret_instr);
+    sequence.EndBlock(RpoNumber::FromInt(0));
+
+    OptimizedCompilationInfo info("gap_cycle_mixed_gp_rep", zone,
+                                  CodeKind::FOR_TESTING);
+    CodeGenerator codegen(zone, &frame, &linkage, &sequence, &info, isolate,
+                          std::optional<OsrHelper>(), kNoSourcePosition,
+                          nullptr, AssemblerOptions::Default(isolate),
+                          Builtin::kNoBuiltinId, 0, 0);
+    codegen.AssembleCode();
+    DirectHandle<Code> code = codegen.FinalizeCode().ToHandleChecked();
+    auto fn = GeneratedCode<uint64_t>::FromCode(isolate, *code);
+    CHECK_EQ(payload, fn.Call());
+  };
+
+  static constexpr uint64_t kFull64Payload = 0x7123456789ABCDEFULL;
+  // Bit 31 set with zero upper 32 bits, to catch accidental sign-extension of
+  // zero-extended 32-bit values moved into 64-bit destinations.
+  static constexpr uint64_t kZeroExtended32Payload = 0x0000000089ABCDEFULL;
+
+  for (CycleKind kind :
+       {CycleKind::kRegToRegWithScratchReg, CycleKind::kRegToRegWithStackTemp,
+        CycleKind::kStackToRegWithScratchReg}) {
+    // 64-bit source to 32-bit destination must preserve upper 32 bits.
+    RunCycleCheck(MachineRepresentation::kWord64,
+                  MachineRepresentation::kWord32, kind, kFull64Payload);
+    RunCycleCheck(MachineRepresentation::kSandboxedPointer,
+                  MachineRepresentation::kWord32, kind, kFull64Payload);
+    RunCycleCheck(MachineRepresentation::kTagged,
+                  MachineRepresentation::kWord32, kind, kFull64Payload);
+    RunCycleCheck(MachineRepresentation::kTaggedSigned,
+                  MachineRepresentation::kWord32, kind, kFull64Payload);
+#ifdef V8_COMPRESS_POINTERS
+    RunCycleCheck(MachineRepresentation::kWord64,
+                  MachineRepresentation::kCompressed, kind, kFull64Payload);
+    RunCycleCheck(MachineRepresentation::kTagged,
+                  MachineRepresentation::kCompressed, kind, kFull64Payload);
+#endif
+    // 32-bit source holding a zero-extended 64-bit value to 64-bit destination.
+    RunCycleCheck(MachineRepresentation::kWord32,
+                  MachineRepresentation::kWord64, kind, kZeroExtended32Payload);
+    RunCycleCheck(MachineRepresentation::kWord32,
+                  MachineRepresentation::kTagged, kind, kZeroExtended32Payload);
+  }
+}
+#endif  // V8_TARGET_ARCH_64_BIT
 
 #if V8_ENABLE_WEBASSEMBLY
 namespace {
@@ -1736,8 +2260,8 @@ TEST(Regress_1171759) {
 
   m.Return(m.Int32Constant(0));
 
-  OptimizedCompilationInfo info(base::ArrayVector("testing"),
-                                handles.main_zone(), CodeKind::WASM_FUNCTION);
+  OptimizedCompilationInfo info("testing", handles.main_zone(),
+                                CodeKind::WASM_FUNCTION);
   wasm::WasmCompilationResult result = Pipeline::GenerateWasmCodeForTesting(
       &info, handles.main_isolate(), desc, m.graph(),
       AssemblerOptions::Default(handles.main_isolate()), m.ExportForTest());

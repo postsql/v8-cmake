@@ -388,6 +388,13 @@ struct PushParameter {
 
   turboshaft::OpIndex node;
   LinkageLocation location;
+#if V8_ENABLE_WEBASSEMBLY && V8_ENABLE_SANDBOX
+  // For Wasm return values in registers that need pointer decompression, `op`
+  // holds the temporary operand at the return location so `EmitPrepareResults`
+  // can decompress it into `node`'s virtual register.
+  InstructionOperand op;
+  bool needs_decompression = false;
+#endif  // V8_ENABLE_WEBASSEMBLY && V8_ENABLE_SANDBOX
 };
 
 enum class FrameStateInputKind { kAny, kStackSlot };
@@ -612,8 +619,6 @@ class V8_EXPORT_PRIVATE InstructionSelector final
   // to the roots register.
   bool CanAddressRelativeToRootsRegister(
       const ExternalReference& reference) const;
-  // Check if we can use the roots register to access GC roots.
-  bool CanUseRootsRegister() const;
 
   Isolate* isolate() const { return sequence()->isolate(); }
 
@@ -900,8 +905,8 @@ class V8_EXPORT_PRIVATE InstructionSelector final
     turboshaft::OpIndex base() const { return op_->base(); }
     turboshaft::OptionalOpIndex index() const { return op_->index(); }
     turboshaft::OpIndex value() const { return op_->value(); }
-    IndirectPointerTag indirect_pointer_tag() const {
-      return static_cast<IndirectPointerTag>(op_->indirect_pointer_tag());
+    TrustedPointerTag trusted_pointer_tag() const {
+      return static_cast<TrustedPointerTag>(op_->trusted_pointer_tag());
     }
     int32_t displacement() const {
       static_assert(
@@ -1113,6 +1118,9 @@ class V8_EXPORT_PRIVATE InstructionSelector final
   // Visit the node and generate code for IEEE 754 functions.
   void VisitFloat64Ieee754Binop(turboshaft::OpIndex, InstructionCode code);
   void VisitFloat64Ieee754Unop(turboshaft::OpIndex, InstructionCode code);
+
+  void EmitDecompressTaggedParam(turboshaft::OpIndex node,
+                                 InstructionOperand temp_op);
 
 #define DECLARE_GENERATOR_T(x) void Visit##x(turboshaft::OpIndex node);
   DECLARE_GENERATOR_T(Word32And)
@@ -1617,6 +1625,11 @@ class V8_EXPORT_PRIVATE InstructionSelector final
   // for non-phi nodes.
   ZoneVector<Upper32BitsState> phi_states_;
 #endif
+
+#if V8_ENABLE_WEBASSEMBLY && V8_ENABLE_SANDBOX
+  ZoneVector<std::pair<turboshaft::OpIndex, int>> params_to_decompress_;
+  int param_instructions_start_ = -1;
+#endif  // V8_ENABLE_WEBASSEMBLY && V8_ENABLE_SANDBOX
 
 // CCMP branch-cascade fusion is compiled only where a ccmp emission path
 // exists: ARM64 (native) and x64 with APX (runtime-gated on APX availability).

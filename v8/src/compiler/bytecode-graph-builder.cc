@@ -1733,9 +1733,13 @@ void BytecodeGraphBuilder::VisitLdaContextSlot() {
 }
 
 void BytecodeGraphBuilder::VisitLdaImmutableContextSlot() {
+  // LdaImmutableContextSlot is emitted for kNotAssigned context slots, which
+  // the debugger may still mutate at runtime.
+  bool immutable =
+      !broker()->isolate()->is_context_slot_not_assigned_unreliable();
   const Operator* op = javascript()->LoadContextNoCell(
       bytecode_iterator().GetUnsignedImmediateOperand(2),
-      bytecode_iterator().GetContextSlotOperand(1), true);
+      bytecode_iterator().GetContextSlotOperand(1), immutable);
   Node* node = NewNode(op);
   Node* context =
       environment()->LookupRegister(bytecode_iterator().GetRegisterOperand(0));
@@ -1758,8 +1762,12 @@ void BytecodeGraphBuilder::VisitLdaCurrentContextSlot() {
 }
 
 void BytecodeGraphBuilder::VisitLdaImmutableCurrentContextSlot() {
+  // LdaImmutableCurrentContextSlot is emitted for kNotAssigned context slots,
+  // which the debugger may still mutate at runtime.
+  bool immutable =
+      !broker()->isolate()->is_context_slot_not_assigned_unreliable();
   const Operator* op = javascript()->LoadContextNoCell(
-      0, bytecode_iterator().GetContextSlotOperand(0), true);
+      0, bytecode_iterator().GetContextSlotOperand(0), immutable);
   Node* node = NewNode(op);
   environment()->BindAccumulator(node);
 }
@@ -2430,15 +2438,7 @@ void BytecodeGraphBuilder::VisitPopContext() {
 void BytecodeGraphBuilder::VisitCreateClosure() {
   SharedFunctionInfoRef shared_info =
       MakeRefForConstantPoolOperand<SharedFunctionInfo>(0);
-  AllocationType allocation =
-      interpreter::CreateClosureFlags::PretenuredBit::decode(
-          bytecode_iterator().GetFlag8Operand(2))
-          ? AllocationType::kOld
-          : AllocationType::kYoung;
-  CodeRef compile_lazy =
-      MakeRef(broker(), *BUILTIN_CODE(jsgraph()->isolate(), CompileLazy));
-  const Operator* op =
-      javascript()->CreateClosure(shared_info, compile_lazy, allocation);
+  const Operator* op = javascript()->CreateClosure(shared_info);
   Node* closure = NewNode(
       op, BuildLoadFeedbackCell(bytecode_iterator().GetFeedbackSlotOperand(1)));
   environment()->BindAccumulator(closure);

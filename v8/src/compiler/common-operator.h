@@ -541,7 +541,7 @@ ExitMachineGraphParametersOf(const Operator* op) V8_WARN_UNUSED_RESULT;
 #if V8_ENABLE_SANDBOX
 struct LoadTrustedPointerParameters {
   int offset;
-  IndirectPointerTagRange tag;
+  TrustedPointerTagRange tag;
 
   bool operator==(const LoadTrustedPointerParameters&) const = default;
 };
@@ -631,7 +631,7 @@ class V8_EXPORT_PRIVATE CommonOperatorBuilder final
   const Operator* CompressedHeapConstant(const Handle<HeapObject>&);
   const Operator* TrustedHeapConstant(const Handle<HeapObject>&);
 #if V8_ENABLE_SANDBOX
-  const Operator* LoadTrustedPointer(int offset, IndirectPointerTagRange tag);
+  const Operator* LoadTrustedPointer(int offset, TrustedPointerTagRange tag);
 #endif
   const Operator* ObjectId(uint32_t);
 
@@ -755,7 +755,8 @@ class FrameState : public CommonNodeWrapperBase {
   Node* locals() const {
     Node* n = node()->InputAt(kFrameStateLocalsInput);
     DCHECK(n->opcode() == IrOpcode::kStateValues ||
-           n->opcode() == IrOpcode::kTypedStateValues);
+           n->opcode() == IrOpcode::kTypedStateValues ||
+           n->opcode() == IrOpcode::kDeadValue);
     return n;
   }
   // TODO(jgruber): Consider renaming this to the more meaningful

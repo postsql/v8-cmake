@@ -201,7 +201,7 @@ JSInliningHeuristic::Candidate JSInliningHeuristic::CollectFunctions(
     if (CanConsiderForInlining(broker(), feedback_cell)) {
       out.shared_info = feedback_cell.shared_function_info(broker()).value();
       out.bytecode[0] = out.shared_info->GetBytecodeArray(broker());
-      CHECK(out.shared_info->equals(n.Parameters().shared_info()));
+      CHECK(out.shared_info->equals(n.shared_info()));
     }
     out.num_functions = 1;
     return out;
@@ -398,6 +398,7 @@ struct NodeAndIndex {
 bool CollectStateValuesOwnedUses(Node* node, Node* state_values,
                                  NodeAndIndex* uses_buffer, size_t* use_count,
                                  size_t max_uses) {
+  if (state_values->opcode() == IrOpcode::kDeadValue) return false;
   // Only accumulate states that are not shared with other users.
   if (state_values->UseCount() > 1) return true;
   for (int i = 0; i < state_values->InputCount(); i++) {
@@ -423,6 +424,7 @@ Node* JSInliningHeuristic::DuplicateStateValuesAndRename(Node* state_values,
                                                          StateCloneMode mode) {
   // Only rename in states that are not shared with other users. This needs to
   // be in sync with the condition in {CollectStateValuesOwnedUses}.
+  DCHECK_NE(state_values->opcode(), IrOpcode::kDeadValue);
   Node* copy = (mode == kChangeInPlace && state_values->UseCount() <= 1)
                    ? state_values
                    : nullptr;
@@ -649,7 +651,10 @@ bool JSInliningHeuristic::TryReuseDispatch(Node* node, Node* callee,
   // Collect the uses to check case 2.
   Node* checkpoint_state = nullptr;
   if (checkpoint) {
-    checkpoint_state = checkpoint->InputAt(0);
+    checkpoint_state = NodeProperties::GetFrameStateInput(checkpoint);
+    // {checkpoint} may still be on the GraphReducer stack while its FrameState
+    // input has already been replaced with DeadValue by DeadCodeElimination.
+    if (checkpoint_state->opcode() != IrOpcode::kFrameState) return false;
     if (!CollectFrameStateUniqueUses(callee, FrameState{checkpoint_state},
                                      replaceable_uses, &replaceable_uses_count,
                                      kMaxUses)) {

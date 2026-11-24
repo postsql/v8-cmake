@@ -1247,7 +1247,7 @@ Reduction JSNativeContextSpecialization::ReduceJSLoadGlobal(Node* node) {
       value = effect =
           graph()->NewNode(javascript()->LoadContextNoCell(
                                0, feedback.slot_index(), feedback.immutable()),
-                           script_context, effect);
+                           script_context, effect, control);
     }
     ReplaceWithValue(node, value, effect, control);
     return Replace(value);
@@ -2348,10 +2348,7 @@ Reduction JSNativeContextSpecialization::ReduceElementAccess(
         // need to guard against changes to that below).
         if ((IsHoleyOrDictionaryElementsKind(receiver_map.elements_kind()) ||
              StoreModeCanGrow(feedback.keyed_mode().store_mode())) &&
-#if V8_ENABLE_WEBASSEMBLY
-            !(receiver_map.IsWasmObjectMap() &&
-              access_info.is_proxy_on_prototype()) &&
-#endif  // V8_ENABLE_WEBASSEMBLY
+            !access_info.is_proxy_on_prototype() &&
             !receiver_map.PrototypesElementsDoNotHaveAccessorsOrThrow(
                 broker(), &prototype_maps)) {
           return NoChange();
@@ -3298,10 +3295,6 @@ JSNativeContextSpecialization::BuildPropertyStore(
         value = effect =
             graph()->NewNode(simplified()->CheckNumber(FeedbackSource()), value,
                              effect, control);
-        if (access_info.IsFastDataConstant()) {
-          value = graph()->NewNode(jsgraph()->simplified()->NumberSilenceNaN(),
-                                   value);
-        }
         if (access_info.HasTransitionMap()) {
           // Allocate a HeapNumber for the new property.
           AllocationBuilder a(jsgraph(), broker(), effect, control);
@@ -3373,7 +3366,7 @@ JSNativeContextSpecialization::BuildPropertyStore(
       case MachineRepresentation::kCompressedPointer:
       case MachineRepresentation::kCompressed:
       case MachineRepresentation::kProtectedPointer:
-      case MachineRepresentation::kIndirectPointer:
+      case MachineRepresentation::kTrustedPointer:
       case MachineRepresentation::kSandboxedPointer:
       case MachineRepresentation::kWord8:
       case MachineRepresentation::kWord16:
@@ -3447,12 +3440,6 @@ JSNativeContextSpecialization::BuildPropertyStore(
                                 value, effect, control);
       if (maybe_initializing_store &&
           access_info.field_representation().IsDouble()) {
-        // The map store must follow the value write and use release semantics
-        // so background threads (e.g. concurrent compiler) see a consistent
-        // initialized state upon observing the HeapNumber map.
-        effect = graph()->NewNode(
-            jsgraph()->machine()->MemoryBarrier(AtomicMemoryOrder::kAcqRel),
-            effect, control);
         effect = graph()->NewNode(
             simplified()->StoreField(AccessBuilder::ForMap()), storage,
             jsgraph()->ConstantNoHole(broker()->heap_number_map(), broker()),
@@ -3603,21 +3590,23 @@ JSNativeContextSpecialization::BuildElementAccess(
   ZoneVector<MapRef> const& receiver_maps =
       access_info.lookup_start_object_maps();
 
+#if V8_ENABLE_WEBASSEMBLY
+  if (access_info.is_proxy_on_prototype()) {
+    DCHECK_EQ(receiver_maps.size(), 1);
+    DCHECK(receiver_maps.front().IsAnyWasmObjectMap());
+    return BuildPrototypeProxyElementAccess(
+        receiver, index, value, effect, control, context, access_info,
+        language_mode, keyed_mode, if_exceptions, frame_state);
+  }
+#endif  // V8_ENABLE_WEBASSEMBLY
+
+  DCHECK_NE(elements_kind, NO_ELEMENTS);
   if (IsTypedArrayElementsKind(elements_kind) ||
       IsRabGsabTypedArrayElementsKind(elements_kind)) {
     return BuildElementAccessForTypedArrayOrRabGsabTypedArray(
         receiver, index, value, effect, control, context, elements_kind,
         keyed_mode);
   }
-
-#if V8_ENABLE_WEBASSEMBLY
-  if (receiver_maps.size() == 1 && receiver_maps.front().IsWasmObjectMap() &&
-      access_info.is_proxy_on_prototype()) {
-    return BuildPrototypeProxyElementAccess(
-        receiver, index, value, effect, control, context, access_info,
-        language_mode, keyed_mode, if_exceptions, frame_state);
-  }
-#endif  // V8_ENABLE_WEBASSEMBLY
 
   // Load the elements for the {receiver}.
   Node* elements = effect = graph()->NewNode(

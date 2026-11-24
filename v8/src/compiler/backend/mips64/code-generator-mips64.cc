@@ -930,8 +930,8 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     }
     case kArchAtomicStoreSkippedWriteBarrier:
     case kArchStoreSkippedWriteBarrier:
-    case kArchStoreIndirectWithWriteBarrier:
-    case kArchStoreIndirectSkippedWriteBarrier:
+    case kArchStoreTrustedWithWriteBarrier:
+    case kArchStoreTrustedSkippedWriteBarrier:
       UNREACHABLE();
     case kArchStackSlot: {
       FrameOffset offset =
@@ -4558,6 +4558,7 @@ void CodeGenerator::Pop(InstructionOperand* dest, MachineRepresentation rep) {
     __ Daddu(sp, sp, Operand(dropped_slots * kSystemPointerSize));
   }
   temp_slots_ -= dropped_slots;
+  DCHECK_GE(temp_slots_, 0);
 }
 
 void CodeGenerator::PopTempStackSlots() {
@@ -4646,14 +4647,6 @@ void CodeGenerator::SetPendingMove(MoveOperands* move) {
 }
 
 namespace {
-
-bool Is32BitOperand(InstructionOperand* operand) {
-  DCHECK(operand->IsStackSlot() || operand->IsRegister());
-  MachineRepresentation mr = LocationOperand::cast(operand)->representation();
-  return mr == MachineRepresentation::kWord32 ||
-         mr == MachineRepresentation::kCompressed ||
-         mr == MachineRepresentation::kCompressedPointer;
-}
 
 // When we need only 32 bits, move only 32 bits, otherwise the destination
 // register' upper 32 bits may contain dirty data.

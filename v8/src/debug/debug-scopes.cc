@@ -292,16 +292,45 @@ bool ScopeIterator::AdvanceToScopeNumber(int scope_number) {
   return scope_number == 0 && !Done();
 }
 
+bool ScopeIterator::InPausedFunctionScopes() const {
+  if (function_.is_null() || !HasScope()) return false;
+  // `function_` is only reset after Next() has moved past the closure scope,
+  // so explicitly check that the closure scope is (an ancestor of) the current
+  // scope.
+  for (std::optional<DebugScriptScope> scope = current_scope();
+       scope.has_value(); scope = scope->parent()) {
+    if (scope->scope_index() == closure_scope_index_) return true;
+  }
+  return false;
+}
+
 bool ScopeIterator::HasContext() const {
-  // In rare cases we pause in a scope that doesn't have its context pushed yet.
-  // E.g. when pausing in for-of loop headers (see https://crbug.com/399002824).
-  //
-  // We can detect this by comparing the scope ID of the parsed scope and the
-  // runtime scope.
-  if (HasScope() && NeedsContext() &&
-      current_scope().unique_id_in_script() !=
-          context_->scope_info()->UniqueIdInScript()) {
-    return false;
+  if (HasScope() && NeedsContext()) {
+    // In rare cases we pause in a scope that doesn't have its context pushed
+    // yet. E.g. when pausing in for-of loop headers (see
+    // https://crbug.com/399002824).
+    //
+    // While we are still in the scopes of the paused function, the function's
+    // creation context means that none of the function's own contexts have
+    // been pushed. Check this first: the creation context can belong to a
+    // different script (the caller of a direct eval), so comparing scope IDs,
+    // which are only unique within a script, would be meaningless.
+    // Top-level script and module functions are the exception: they are
+    // created with the script/module context as their context.
+    const bool closure_created_in_own_context =
+        current_scope().is_script_scope() || current_scope().is_module_scope();
+    if (!closure_created_in_own_context && InPausedFunctionScopes() &&
+        *context_ == function_->context()) {
+      return false;
+    }
+
+    // Otherwise, context_ belongs to the same script as current_scope() and
+    // we can detect a not-yet-pushed context by comparing the scope ID of the
+    // parsed scope and the runtime scope.
+    if (current_scope().unique_id_in_script() !=
+        context_->scope_info()->UniqueIdInScript()) {
+      return false;
+    }
   }
 
   return !HasScope() || NeedsContext();
@@ -328,23 +357,6 @@ bool ScopeIterator::NeedsContext() const {
   return needs_context;
 }
 
-bool ScopeIterator::AdvanceOneScope() {
-  if (!HasScope()) return false;
-  if (std::optional<DebugScriptScope> parent = current_scope().parent()) {
-    current_scope_index_ = parent->scope_index();
-    return true;
-  }
-  if (std::optional<DebugScriptScope> outer =
-          FindEvalOuterScope(isolate_, script_)) {
-    script_ =
-        handle(Cast<Script>(script_->eval_from_shared()->script()), isolate_);
-    debug_scope_info_ = handle(*outer->info(), isolate_);
-    current_scope_index_ = outer->scope_index();
-    return true;
-  }
-  return false;
-}
-
 void ScopeIterator::AdvanceOneContext() {
   DCHECK(!IsNativeContext(*context_));
   DCHECK(!context_->previous().is_null());
@@ -361,13 +373,36 @@ void ScopeIterator::AdvanceScope() {
       AdvanceOneContext();
     }
 
-    if (!AdvanceOneScope()) {
+    if (std::optional<DebugScriptScope> parent = current_scope().parent()) {
+      current_scope_index_ = parent->scope_index();
+      continue;
+    }
+
+    if (std::optional<DebugScriptScope> outer =
+            FindEvalOuterScope(isolate_, script_)) {
+      // The root scope of the paused script is either the closure scope itself
+      // or one of its ancestors, so we have left the paused function by now.
+      // Reset `function_` right away: `closure_scope_index_` indexes into the
+      // paused script's scope tree, so comparing it with `current_scope_index_`
+      // in the caller's script tree is meaningless (e.g. both are 0 when
+      // pausing in the top-level code of a direct eval called from another
+      // eval's top-level code).
+      // Do not skip `outer` if `outer->is_hidden()` is true: like
+      // `TryParseAndRetrieveScopes()`, `FindEvalOuterScope()` lands on the
+      // innermost scope at the eval call site (such as the outer block scope
+      // of a `for (let ...)` loop when eval is called in the initializer).
+      function_ = Handle<JSFunction>();
+      script_ =
+          handle(Cast<Script>(script_->eval_from_shared()->script()), isolate_);
+      debug_scope_info_ = handle(*outer->info(), isolate_);
+      current_scope_index_ = outer->scope_index();
+    } else {
       // We left the root of the outermost scope tree we can reach (e.g. the
       // root of an indirect eval, a `new Function` or a wrapped function).
       // Continue with the runtime context chain.
       current_scope_index_ = -1;
-      break;
     }
+    break;
   } while (current_scope().is_hidden());
 }
 
@@ -564,11 +599,21 @@ bool ScopeIterator::SetVariableValue(Handle<String> name,
     case ScopeTypeBlock:
     case ScopeTypeCatch:
     case ScopeTypeModule:
-      if (HasScope()) return SetLocalVariableValue(name, value);
-      if (Type() == ScopeTypeModule && SetModuleVariableValue(name, value)) {
-        return true;
+      if (HasScope()) {
+        if (SetLocalVariableValue(name, value)) return true;
+      } else {
+        if (Type() == ScopeTypeModule && SetModuleVariableValue(name, value)) {
+          return true;
+        }
+        if (SetContextVariableValue(name, value)) return true;
       }
-      return SetContextVariableValue(name, value);
+      // The varblock scope of a sloppy function with non-simple parameters
+      // can hold eval-introduced variables on its context extension object.
+      // Mirror VisitLocalScope, which lists them.
+      if (HasContext() && context_->scope_info()->SloppyEvalCanExtendVars()) {
+        return SetContextExtensionValue(name, value);
+      }
+      return false;
 
     case ScopeTypeLocal:
     case ScopeTypeClosure:
@@ -999,8 +1044,6 @@ bool ScopeIterator::SetLocalVariableValue(DirectHandle<String> variable_name,
         case VariableLocation::LOOKUP:
         case VariableLocation::UNALLOCATED:
           // Drop assignments to unallocated locals.
-          DCHECK(*variable_name == ReadOnlyRoots(isolate_).this_string() ||
-                 *variable_name == ReadOnlyRoots(isolate_).arguments_string());
           return false;
 
         case VariableLocation::REPL_GLOBAL:
@@ -1058,11 +1101,17 @@ bool ScopeIterator::SetLocalVariableValue(DirectHandle<String> variable_name,
           // don't match (https://crbug.com/753338).
           // Skip the write if the context's ScopeInfo doesn't know anything
           // about this variable.
-          if (context_->scope_info()->ContextSlotIndex(*variable_name) !=
-              index) {
+          VariableLookupResult lookup_result;
+          if (context_->scope_info()->ContextSlotIndex(
+                  *variable_name, &lookup_result) != index) {
             return false;
           }
           Context::Set(context_, index, new_value, isolate_);
+          if (lookup_result.maybe_assigned_flag == kNotAssigned) {
+            // Mutating a kNotAssigned context slot via the debugger invalidates
+            // compiler assumptions that kNotAssigned slots are immutable.
+            isolate_->MarkContextSlotNotAssignedIsUnreliable();
+          }
           return true;
 
         case VariableLocation::MODULE:
@@ -1095,9 +1144,16 @@ bool ScopeIterator::SetContextExtensionValue(DirectHandle<String> variable_name,
 
 bool ScopeIterator::SetContextVariableValue(DirectHandle<String> variable_name,
                                             DirectHandle<Object> new_value) {
-  int slot_index = context_->scope_info()->ContextSlotIndex(*variable_name);
+  VariableLookupResult lookup_result;
+  int slot_index =
+      context_->scope_info()->ContextSlotIndex(*variable_name, &lookup_result);
   if (slot_index < 0) return false;
   Context::Set(context_, slot_index, new_value, isolate_);
+  if (lookup_result.maybe_assigned_flag == kNotAssigned) {
+    // Mutating a kNotAssigned context slot via the debugger invalidates
+    // compiler assumptions that kNotAssigned slots are immutable.
+    isolate_->MarkContextSlotNotAssignedIsUnreliable();
+  }
   return true;
 }
 
@@ -1131,6 +1187,11 @@ bool ScopeIterator::SetScriptVariableValue(DirectHandle<String> variable_name,
     DirectHandle<Context> script_context(
         script_contexts->get(lookup_result.context_index), isolate_);
     Context::Set(script_context, lookup_result.slot_index, new_value, isolate_);
+    if (lookup_result.maybe_assigned_flag == kNotAssigned) {
+      // Mutating a kNotAssigned context slot via the debugger invalidates
+      // compiler assumptions that kNotAssigned slots are immutable.
+      isolate_->MarkContextSlotNotAssignedIsUnreliable();
+    }
     return true;
   }
 

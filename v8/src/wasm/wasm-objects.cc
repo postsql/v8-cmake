@@ -140,7 +140,8 @@ DirectHandle<String> WasmModuleObject::ExtractUtf8StringFromModuleBytes(
   DCHECK_IMPLIES(shared, !internalize);
   return internalize
              ? factory->InternalizeUtf8String(
-                   base::Vector<const char>::cast(name_vec))
+                   {reinterpret_cast<const char*>(name_vec.begin()),
+                    name_vec.size()})
              : factory
                    ->NewStringFromUtf8(
                        name_vec, UnicodeConfig(unibrow::Utf8Variant::kLossyUtf8,
@@ -302,7 +303,7 @@ int WasmTableObject::Grow(Isolate* isolate, DirectHandle<WasmTableObject> table,
   uint64_t static_max_size = wasm::max_table_size();
   uint32_t max_size = static_cast<uint32_t>(std::min(
       static_max_size, table->maximum_length_u64().value_or(static_max_size)));
-  DCHECK_LE(old_size, max_size);
+  SBXCHECK_LE(old_size, max_size);
   if (count > max_size - old_size) return -1;
 
   uint32_t new_size = old_size + count;
@@ -323,11 +324,8 @@ int WasmTableObject::Grow(Isolate* isolate, DirectHandle<WasmTableObject> table,
 
   bool has_dispatch_table = !dispatch_table.is_identical_to(
       isolate->factory()->empty_wasm_dispatch_table());
-  DCHECK_EQ(
-      table->unsafe_type().ref_type_kind() == wasm::RefTypeKind::kFunction,
-      has_dispatch_table);
   if (has_dispatch_table) {
-    DCHECK_EQ(old_size, dispatch_table->length());
+    SBXCHECK_EQ(old_size, dispatch_table->length());
     dispatch_table = WasmDispatchTable::Grow(isolate, dispatch_table, new_size);
     table->set_trusted_dispatch_table(*dispatch_table);
     DCHECK_EQ(new_size, table->trusted_dispatch_table(isolate)->length());
@@ -389,9 +387,9 @@ void WasmTableObject::SetFunctionTableEntry(
     table->entries()->set(entry_index, ReadOnlyRoots(isolate).wasm_null());
     return;
   }
-  DCHECK(IsWasmFuncRef(*entry));
-  DirectHandle<Object> external = WasmInternalFunction::GetOrCreateExternal(
-      direct_handle(Cast<WasmFuncRef>(*entry)->internal(isolate), isolate));
+  DirectHandle<Object> external =
+      WasmInternalFunction::GetOrCreateExternal(direct_handle(
+          CheckedCast<WasmFuncRef>(*entry)->internal(isolate), isolate));
 
   UpdateDispatchTableMultiple(isolate, dispatch_table, entry_index, 1,
                               external);
@@ -405,53 +403,16 @@ void WasmTableObject::Set(Isolate* isolate, DirectHandle<WasmTableObject> table,
   // Callers need to perform bounds checks, type check, and error handling.
   DCHECK(table->is_in_bounds(index));
 
-  DirectHandle<FixedArray> entries(table->entries(), isolate);
   // The FixedArray is addressed with int's.
   int entry_index = static_cast<int>(index);
 
-  wasm::ValueType unsafe_type = table->unsafe_type();
-  if (unsafe_type.has_index()) {
-    DCHECK(table->has_trusted_data());
-    const wasm::WasmModule* module = table->trusted_data(isolate)->module();
-    if (module->has_signature(table->type(module).ref_index())) {
-      SetFunctionTableEntry(isolate, table, dispatch_table, entry_index, entry);
-      return;
-    }
-    entries->set(entry_index, *entry);
-    return;
+  bool has_dispatch_table = !dispatch_table.is_identical_to(
+      isolate->factory()->empty_wasm_dispatch_table());
+  if (has_dispatch_table) {
+    SetFunctionTableEntry(isolate, table, dispatch_table, entry_index, entry);
+  } else {
+    table->entries()->set(entry_index, *entry);
   }
-  switch (unsafe_type.generic_kind()) {
-    case wasm::GenericKind::kExtern:
-    case wasm::GenericKind::kString:
-    case wasm::GenericKind::kStringViewWtf8:
-    case wasm::GenericKind::kStringViewWtf16:
-    case wasm::GenericKind::kStringViewIter:
-    case wasm::GenericKind::kEq:
-    case wasm::GenericKind::kStruct:
-    case wasm::GenericKind::kArray:
-    case wasm::GenericKind::kAny:
-    case wasm::GenericKind::kI31:
-    case wasm::GenericKind::kNone:
-    case wasm::GenericKind::kNoFunc:
-    case wasm::GenericKind::kNoExtern:
-    case wasm::GenericKind::kExn:
-    case wasm::GenericKind::kNoExn:
-    case wasm::GenericKind::kCont:
-    case wasm::GenericKind::kNoCont:
-    case wasm::GenericKind::kWaitqueue:
-    case wasm::GenericKind::kNoWaitqueue:
-      entries->set(entry_index, *entry);
-      return;
-    case wasm::GenericKind::kFunc:
-      SetFunctionTableEntry(isolate, table, dispatch_table, entry_index, entry);
-      return;
-    case wasm::GenericKind::kBottom:
-    case wasm::GenericKind::kTop:
-    case wasm::GenericKind::kVoid:
-    case wasm::GenericKind::kExternString:
-      break;
-  }
-  UNREACHABLE();  // Safely catches corrupted values read from the sandbox.
 }
 
 DirectHandle<Object> WasmTableObject::Get(Isolate* isolate,
@@ -468,63 +429,14 @@ DirectHandle<Object> WasmTableObject::Get(Isolate* isolate,
 
   if (IsWasmNull(*entry)) return entry;
   if (IsWasmFuncRef(*entry)) return entry;
+  if (!IsTuple2(*entry)) return entry;
 
-  wasm::ValueType unsafe_type = table->unsafe_type();
-  if (unsafe_type.has_index()) {
-    DCHECK(table->has_trusted_data());
-    const WasmModule* module = table->trusted_data(isolate)->module();
-    wasm::ModuleTypeIndex element_type = table->type(module).ref_index();
-    if (module->has_array(element_type) || module->has_struct(element_type) ||
-        module->has_cont_type(element_type)) {
-      return entry;
-    }
-    DCHECK(module->has_signature(element_type));
-    // Fall through.
-  } else {
-    bool is_func = false;
-    switch (unsafe_type.generic_kind()) {
-      case wasm::GenericKind::kStringViewWtf8:
-      case wasm::GenericKind::kStringViewWtf16:
-      case wasm::GenericKind::kStringViewIter:
-      case wasm::GenericKind::kExtern:
-      case wasm::GenericKind::kString:
-      case wasm::GenericKind::kEq:
-      case wasm::GenericKind::kI31:
-      case wasm::GenericKind::kStruct:
-      case wasm::GenericKind::kArray:
-      case wasm::GenericKind::kAny:
-      case wasm::GenericKind::kNone:
-      case wasm::GenericKind::kNoFunc:
-      case wasm::GenericKind::kNoExtern:
-      case wasm::GenericKind::kExn:
-      case wasm::GenericKind::kNoExn:
-      case wasm::GenericKind::kCont:
-      case wasm::GenericKind::kNoCont:
-      case wasm::GenericKind::kWaitqueue:
-      case wasm::GenericKind::kNoWaitqueue:
-        return entry;
-      case wasm::GenericKind::kFunc:
-        // Placeholder; handled below.
-        is_func = true;
-        break;
-      case wasm::GenericKind::kBottom:
-      case wasm::GenericKind::kTop:
-      case wasm::GenericKind::kVoid:
-      case wasm::GenericKind::kExternString:
-        break;
-    }
-    // The code below is sandbox-safe, but we can be more explicit about
-    // rejecting corruption (invalid {unsafe_type}) here.
-    if (!is_func) UNREACHABLE();
-  }
-
-  // {entry} is not a valid entry in the table. It has to be a placeholder
-  // for lazy initialization.
+  // {entry} is a placeholder for lazy initialization.
   DirectHandle<Tuple2> tuple = Cast<Tuple2>(entry);
-  auto trusted_instance_data = direct_handle(
-      Cast<WasmInstanceObject>(tuple->value1())->trusted_data(isolate),
+  DirectHandle<WasmTrustedInstanceData> trusted_instance_data(
+      CheckedCast<WasmInstanceObject>(tuple->value1())->trusted_data(isolate),
       isolate);
-  int function_index = Cast<Smi>(tuple->value2()).value();
+  int function_index = CheckedCast<Smi>(tuple->value2()).value();
 
   // Create a WasmInternalFunction and WasmFuncRef for the function if it does
   // not exist yet, and store it in the table.
@@ -560,9 +472,8 @@ bool FunctionSigMatchesTable(wasm::CanonicalTypeIndex sig_id,
   // types before installing the dispatch table entry. There are three
   // alternative success conditions:
   // (1) Generic "funcref" tables can hold any function entry.
-  if (!table_type.has_index() &&
-      table_type.generic_kind() == wasm::GenericKind::kFunc) {
-    return true;
+  if (!table_type.has_index()) {
+    return table_type.generic_kind() == wasm::GenericKind::kFunc;
   }
   // (2) Most function types are expected to be final, so they can be compared
   //     cheaply by canonicalized index equality.
@@ -1108,7 +1019,7 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
     // There are different limits per platform, thus crash if the correctness
     // fuzzer is running.
     if (v8_flags.correctness_fuzzer_suppressions) {
-      FATAL("could not grow wasm memory");
+      base::FatalNoSecurityImpact("could not grow wasm memory");
     }
     return -1;
   }
@@ -1182,7 +1093,7 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
   if (!new_backing_store) {
     // Crash on out-of-memory if the correctness fuzzer is running.
     if (v8_flags.correctness_fuzzer_suppressions) {
-      FATAL("could not grow wasm memory");
+      base::FatalNoSecurityImpact("could not grow wasm memory");
     }
     // Set the non-determinism flag in the WasmEngine.
     wasm::WasmEngine::set_had_nondeterminism();
@@ -1400,7 +1311,7 @@ Tagged<Object> ImportedFunctionEntry::maybe_callable() {
 }
 
 Tagged<JSReceiver> ImportedFunctionEntry::callable() {
-  return TrustedCast<JSReceiver>(
+  return Cast<JSReceiver>(
       TrustedCast<WasmImportData>(implicit_arg())->callable());
 }
 
@@ -1451,7 +1362,7 @@ void WasmTrustedInstanceData::SetRawMemory(uint32_t memory_index,
     CHECK_EQ(size_or_address,
              reinterpret_cast<Address>(
                  TrustedCast<TrustedManaged<BackingStore>>(backing_store_obj)
-                     ->raw()
+                     ->raw(DisallowGarbageCollection{})
                      ->byte_length_address()));
   }
   // All memory bases and sizes (or addresses of atomic sizes for shared
@@ -1612,17 +1523,6 @@ DirectHandle<WasmTrustedInstanceData> WasmTrustedInstanceData::New(
   instance_object->set_trusted_data(*trusted_data);
   instance_object->set_module_object(*module_object);
   trusted_data->set_instance_object(*instance_object);
-
-  // Insert the new instance into the script's weak list of instances. This
-  // list is used for breakpoints affecting all instances belonging to the
-  // script.
-  DCHECK_EQ(module_object->script()->type(), Script::Type::kWasm);
-  DirectHandle<WeakArrayList> weak_instance_list(
-      module_object->script()->wasm_weak_instance_list(), isolate);
-  weak_instance_list =
-      WeakArrayList::Append(isolate, weak_instance_list,
-                            MaybeObjectDirectHandle::Weak(instance_object));
-  module_object->script()->set_wasm_weak_instance_list(*weak_instance_list);
 
   return trusted_data;
 }
@@ -2448,6 +2348,9 @@ void DispatchTableClear(Tagged<DispatchTable> dispatch_table, int index,
 
 void WasmDispatchTable::Clear(
     int index, WasmDispatchTable::NewOrExistingEntry new_or_existing) {
+  if (new_or_existing == WasmDispatchTable::kExistingEntry) {
+    SBXCHECK(table_type().is_nullable());
+  }
   DispatchTableClear<WasmDispatchTable>(this, index, new_or_existing);
 #if V8_ENABLE_DRUMBRAKE
   if (v8_flags.wasm_jitless &&
@@ -2986,7 +2889,7 @@ std::unique_ptr<char[]> WasmExportedFunction::GetDebugName(
   size_t len = strlen(kPrefix) + sig->all().size() + 2;
   auto buffer = base::UniqueArray<char>::New(len);
   memcpy(buffer.begin(), kPrefix, strlen(kPrefix));
-  PrintSignature(buffer.as_vector() + strlen(kPrefix), sig);
+  PrintSignature(buffer.subspan(strlen(kPrefix)), sig);
   return buffer.ReleaseData();
 }
 
@@ -3460,7 +3363,8 @@ MaybeDirectHandle<Object> JSToWasmObject(Isolate* isolate,
                                          const char** error_message) {
   CanonicalValueType canonical;
   if (unsafe_expected_type.has_index()) {
-    SBXCHECK(module->has_type(unsafe_expected_type.ref_index()));
+    SBXCHECK(module != nullptr &&
+             module->has_type(unsafe_expected_type.ref_index()));
     canonical = module->canonical_type(unsafe_expected_type);
   } else {
     // Some code paths did check this before, but to be on the safe side we
@@ -3472,7 +3376,8 @@ MaybeDirectHandle<Object> JSToWasmObject(Isolate* isolate,
 }
 
 DirectHandle<Object> WasmToJSObject(Isolate* isolate,
-                                    DirectHandle<Object> value) {
+                                    DirectHandle<Object> value,
+                                    UnshareStringsMode unshare_strings) {
   if (IsWasmNull(*value)) {
     return direct_handle(ReadOnlyRoots(isolate).null_value(), isolate);
   }
@@ -3493,9 +3398,11 @@ DirectHandle<Object> WasmToJSObject(Isolate* isolate,
     return WasmInternalFunction::GetOrCreateExternal(internal);
   }
   if (IsString(*value)) {
-    DirectHandle<String> string = Cast<String>(value);
-    if (HeapLayout::InWritableSharedSpace(*string)) {
-      return String::Unshare(isolate, string);
+    if (unshare_strings) {
+      DirectHandle<String> string = Cast<String>(value);
+      if (HeapLayout::InWritableSharedSpace(*string)) {
+        return String::Unshare(isolate, string);
+      }
     }
   } else if (IsWasmCustomMap(*value)) {
     DirectHandle<WasmCustomMap> map = Cast<WasmCustomMap>(value);

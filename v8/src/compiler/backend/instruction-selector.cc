@@ -93,6 +93,10 @@ InstructionSelector::InstructionSelector(
       node_count_(node_count),
       phi_states_(zone)
 #endif
+#if V8_ENABLE_WEBASSEMBLY && V8_ENABLE_SANDBOX
+      ,
+      params_to_decompress_(zone)
+#endif
 #if V8_TARGET_ARCH_ARM64 || defined(V8_ENABLE_APX_F)
       ,
       ccmp_cascade_info_(zone)
@@ -562,28 +566,19 @@ void InstructionSelector::SetEffectLevel(OpIndex node, int effect_level) {
 
 bool InstructionSelector::CanAddressRelativeToRootsRegister(
     const ExternalReference& reference) const {
-  // There are three things to consider here:
-  // 1. CanUseRootsRegister: Is kRootRegister initialized?
-  const bool root_register_is_available_and_initialized = CanUseRootsRegister();
-  if (!root_register_is_available_and_initialized) return false;
-
-  // 2. enable_roots_relative_addressing_: Can we address everything on the heap
+  // There are two things to consider here:
+  // 1. enable_roots_relative_addressing_: Can we address everything on the heap
   //    through the root register, i.e. are root-relative addresses to arbitrary
   //    addresses guaranteed not to change between code generation and
   //    execution?
   if (enable_roots_relative_addressing_) return true;
 
-  // 3. IsAddressableThroughRootRegister: Is the target address guaranteed to
-  //    have a fixed root-relative offset? If so, we can ignore 2.
+  // 2. IsAddressableThroughRootRegister: Is the target address guaranteed to
+  //    have a fixed root-relative offset? If so, we can ignore 1.
   const bool this_root_relative_offset_is_constant =
       MacroAssemblerBase::IsAddressableThroughRootRegister(isolate(),
                                                            reference);
   return this_root_relative_offset_is_constant;
-}
-
-bool InstructionSelector::CanUseRootsRegister() const {
-  return linkage()->GetIncomingDescriptor()->flags() &
-         CallDescriptor::kCanUseRoots;
 }
 
 void InstructionSelector::MarkAsRepresentation(MachineRepresentation rep,
@@ -1159,6 +1154,37 @@ void InstructionSelector::InitializeCallBuffer(
         MachineRepresentation rep = location.GetType().representation();
 
         OpIndex output = buffer->output_nodes[i].node;
+#if V8_ENABLE_WEBASSEMBLY && V8_ENABLE_SANDBOX
+        bool is_wasm_tagged_return = false;
+        if (!is_tail_call && buffer->descriptor->IsAnyWasmFunctionCall() &&
+            location.GetType() == MachineType::AnyTagged() && output.valid()) {
+          RegisterRepresentation out_rep;
+          if (buffer->output_nodes.size() == 1) {
+            for (OpIndex call_use : turboshaft_uses(output)) {
+              if (const DidntThrowOp* didnt_throw =
+                      this->Get(call_use).TryCast<DidntThrowOp>()) {
+                if (IsReallyUsed(call_use)) {
+                  is_wasm_tagged_return = true;
+                  out_rep = didnt_throw->outputs_rep()[0];
+                }
+                break;
+              }
+            }
+          } else if (IsReallyUsed(output)) {
+            is_wasm_tagged_return = true;
+            out_rep = Cast<ProjectionOp>(output).rep;
+          }
+          if (is_wasm_tagged_return) {
+            if (out_rep == RegisterRepresentation::Compressed()) {
+              rep = MachineRepresentation::kCompressed;
+            } else {
+              DCHECK_EQ(out_rep, RegisterRepresentation::Tagged());
+              buffer->output_nodes[i].needs_decompression = true;
+            }
+          }
+        }
+#endif  // V8_ENABLE_WEBASSEMBLY && V8_ENABLE_SANDBOX
+
         InstructionOperand op = !output.valid()
                                     ? g.TempLocation(location)
                                     : g.DefineAsLocation(output, location);
@@ -1166,6 +1192,19 @@ void InstructionSelector::InitializeCallBuffer(
 
         // Caller frame slots are defined later via Peek in VisitCall.
         if (!UnallocatedOperand::cast(op).HasFixedSlotPolicy()) {
+#if V8_ENABLE_WEBASSEMBLY && V8_ENABLE_SANDBOX
+          if (is_wasm_tagged_return) {
+            InstructionOperand temp_op = g.TempLocation(location);
+            MarkAsRepresentation(location.GetType().representation(), temp_op);
+            buffer->outputs.push_back(temp_op);
+            buffer->output_nodes[i].op =
+                location.IsRegister()
+                    ? g.UseRegisterForVreg(
+                          UnallocatedOperand::cast(temp_op).virtual_register())
+                    : temp_op;
+            continue;
+          }
+#endif  // V8_ENABLE_WEBASSEMBLY && V8_ENABLE_SANDBOX
           buffer->outputs.push_back(op);
           buffer->output_nodes[i].node = {};
         }
@@ -1541,6 +1580,40 @@ void InstructionSelector::VisitBlock(const Block* block) {
                                    current_node_end};
     }
   }
+
+#if V8_ENABLE_WEBASSEMBLY && V8_ENABLE_SANDBOX
+  if (!params_to_decompress_.empty()) {
+    DCHECK_NE(param_instructions_start_, -1);
+    OperandGenerator g(this);
+    ZoneVector<std::pair<OpIndex, InstructionOperand>> decompress_ops(zone());
+    decompress_ops.reserve(params_to_decompress_.size());
+    for (auto [node, index] : params_to_decompress_) {
+      LinkageLocation location = linkage()->GetParameterLocation(index);
+      InstructionOperand temp_op = g.TempLocation(location);
+      Emit(kArchNop, temp_op);
+      InstructionOperand use_op =
+          location.IsRegister()
+              ? g.UseRegisterForVreg(
+                    UnallocatedOperand::cast(temp_op).virtual_register())
+              : temp_op;
+      decompress_ops.push_back({node, use_op});
+    }
+    int nop_instructions_end = current_num_instructions();
+    for (auto [node, use_op] : decompress_ops) {
+      EmitDecompressTaggedParam(node, use_op);
+    }
+    // `instructions_` is stored in reverse execution order (higher indices are
+    // executed earlier in the block). Rotate so that all `kArchNop` parameter
+    // definitions are at the highest indices (executed first on function
+    // entry), followed by all `EmitDecompressTaggedParam` instructions, before
+    // any physical parameter register can be reused as an output.
+    std::rotate(instructions_.begin() + param_instructions_start_,
+                instructions_.begin() + nop_instructions_end,
+                instructions_.end());
+    params_to_decompress_.clear();
+  }
+  param_instructions_start_ = -1;
+#endif  // V8_ENABLE_WEBASSEMBLY && V8_ENABLE_SANDBOX
 
   // We're done with the block.
   InstructionBlock* instruction_block =
@@ -2036,9 +2109,31 @@ void InstructionSelector::VisitParameter(OpIndex node) {
   const int index = parameter.parameter_index;
   OperandGenerator g(this);
 
+#if V8_ENABLE_WEBASSEMBLY && V8_ENABLE_SANDBOX
+  if (param_instructions_start_ == -1) {
+    // ParameterOps are only present at the beginning of the entry block (and
+    // thus visited last during the reverse iteration in `VisitBlock`).
+    DCHECK_EQ(current_block_->index().id(), 0);
+    param_instructions_start_ = static_cast<int>(instructions_.size());
+  }
+#endif  // V8_ENABLE_WEBASSEMBLY && V8_ENABLE_SANDBOX
+
   if (linkage()->GetParameterLocation(index).IsNullRegister()) {
     EmitMoveParamToFPR(node, index);
   } else {
+#if V8_ENABLE_WEBASSEMBLY && V8_ENABLE_SANDBOX
+    // Parameter 0 is the Wasm instance data (or import data) in trusted space,
+    // which uses a different cage base and must not be decompressed.
+    const CallDescriptor* incoming = linkage()->GetIncomingDescriptor();
+    if ((incoming->IsAnyWasmFunctionCall() || incoming->IsWasmImportWrapper() ||
+         incoming->IsWasmCapiFunction()) &&
+        index > 0 &&
+        (parameter.rep == RegisterRepresentation::Tagged() ||
+         parameter.rep == RegisterRepresentation::Compressed())) {
+      params_to_decompress_.push_back({node, index});
+      return;
+    }
+#endif  // V8_ENABLE_WEBASSEMBLY && V8_ENABLE_SANDBOX
     InstructionOperand op =
         linkage()->ParameterHasSecondaryLocation(index)
             ? g.DefineAsDualLocation(
@@ -2058,11 +2153,9 @@ LinkageLocation ExceptionLocation() {
 
 constexpr InstructionCode EncodeCallDescriptorFlags(
     InstructionCode opcode, CallDescriptor::Flags flags) {
-  // Note: Not all bits of `flags` are preserved.
-  static_assert(CallDescriptor::kFlagsBitsEncodedInInstructionCode ==
-                MiscField::kSize);
+  static_assert(MiscField::is_valid(CallDescriptor::kNoFunctionDescriptor));
   DCHECK(Instruction::IsCallWithDescriptorFlags(opcode));
-  return opcode | MiscField::encode(flags & MiscField::kMax);
+  return opcode | MiscField::encode(flags);
 }
 
 }  // namespace
@@ -2082,6 +2175,10 @@ void InstructionSelector::VisitOsrValue(OpIndex node) {
 void InstructionSelector::VisitPhi(OpIndex node) {
   const Operation& op = Get(node);
   DCHECK_EQ(op.input_count, PredecessorCount(current_block_));
+  if (V8_UNLIKELY(op.input_count == 1)) {
+    EmitIdentity(node);
+    return;
+  }
   PhiInstruction* phi = instruction_zone()->template New<PhiInstruction>(
       instruction_zone(), GetVirtualRegister(node),
       static_cast<size_t>(op.input_count));
@@ -2999,7 +3096,13 @@ void InstructionSelector::VisitNode(OpIndex node) {
       DCHECK_EQ(this->rpo_number(this->block(schedule(), node)).ToInt(), 0);
       MachineType type =
           linkage()->GetParameterType(op.Cast<ParameterOp>().parameter_index);
-      MarkAsRepresentation(type.representation(), node);
+      MachineRepresentation rep = type.representation();
+#if V8_ENABLE_WEBASSEMBLY && V8_ENABLE_SANDBOX
+      if (op.Cast<ParameterOp>().rep == RegisterRepresentation::Compressed()) {
+        rep = MachineRepresentation::kCompressed;
+      }
+#endif  // V8_ENABLE_WEBASSEMBLY && V8_ENABLE_SANDBOX
+      MarkAsRepresentation(rep, node);
       return VisitParameter(node);
     }
     case Opcode::kChange: {

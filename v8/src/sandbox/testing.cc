@@ -25,11 +25,15 @@
 #include "src/objects/fixed-array.h"
 #include "src/objects/fixed-primitive-array-inl.h"
 #include "src/objects/foreign.h"
+#include "src/objects/heap-number.h"
 #include "src/objects/instance-type.h"
 #include "src/objects/js-array-buffer.h"
 #include "src/objects/js-objects.h"
+#include "src/objects/literal-objects.h"
+#include "src/objects/scope-info.h"
 #include "src/objects/tagged-field-inl.h"
 #include "src/objects/templates.h"
+#include "src/sandbox/sandbox-zero-segment.h"
 #include "src/sandbox/sandbox.h"
 #include "src/sandbox/trusted-pointer-table-inl.h"
 
@@ -507,8 +511,7 @@ void SandboxUnpublishTrustedHandle(
     return;
   }
 
-  IndirectPointerHandle handle =
-      static_cast<IndirectPointerHandle>(handle_value);
+  TrustedPointerHandle handle = static_cast<TrustedPointerHandle>(handle_value);
   i_isolate->trusted_pointer_table().Unpublish(handle);
 }
 
@@ -1257,8 +1260,7 @@ void CrashFilter(int signal, siginfo_t* info, void* context) {
             "Caught harmless memory access violation (nullptr dereference).");
       }
 
-      if (faultaddr <
-          (Sandbox::kSmiAddressRange + Sandbox::kSmiAddressRangePadding)) {
+      if (faultaddr < kMinZeroSegmentSize) {
         // Currently we also ignore access violations in the first 4GB of the
         // virtual address space. See crbug.com/1470641 for more details.
         // We need to add some "padding" to the 4GB since we might access a
@@ -1563,6 +1565,7 @@ SandboxTesting::InstanceTypeMap& SandboxTesting::GetInstanceTypeMap() {
     types["JS_BOUND_FUNCTION_TYPE"] = JS_BOUND_FUNCTION_TYPE;
     types["JS_ARRAY_TYPE"] = JS_ARRAY_TYPE;
     types["JS_ARRAY_BUFFER_TYPE"] = JS_ARRAY_BUFFER_TYPE;
+    types["HEAP_NUMBER_TYPE"] = HEAP_NUMBER_TYPE;
     types["FOREIGN_TYPE"] = FOREIGN_TYPE;
     types["JS_REG_EXP_TYPE"] = JS_REG_EXP_TYPE;
     types["JS_TYPED_ARRAY_TYPE"] = JS_TYPED_ARRAY_TYPE;
@@ -1584,8 +1587,14 @@ SandboxTesting::InstanceTypeMap& SandboxTesting::GetInstanceTypeMap() {
     types["FIXED_DOUBLE_ARRAY_TYPE"] = FIXED_DOUBLE_ARRAY_TYPE;
     types["WEAK_HOMOMORPHIC_FIXED_ARRAY_TYPE"] =
         WEAK_HOMOMORPHIC_FIXED_ARRAY_TYPE;
-    types["NATIVE_CONTEXT_TYPE"] = NATIVE_CONTEXT_TYPE;
+    for (std::underlying_type_t<InstanceType> context_type = FIRST_CONTEXT_TYPE;
+         context_type <= LAST_CONTEXT_TYPE; ++context_type) {
+      InstanceType instance_type = static_cast<InstanceType>(context_type);
+      types[ToString(instance_type)] = instance_type;
+    }
+    types["SCOPE_INFO_TYPE"] = SCOPE_INFO_TYPE;
     types["MAP_TYPE"] = MAP_TYPE;
+    types["CLASS_BOILERPLATE_TYPE"] = CLASS_BOILERPLATE_TYPE;
 #ifdef V8_ENABLE_WEBASSEMBLY
     types["WASM_FUNC_REF_TYPE"] = WASM_FUNC_REF_TYPE;
     types["WASM_GLOBAL_OBJECT_TYPE"] = WASM_GLOBAL_OBJECT_TYPE;
@@ -1611,6 +1620,7 @@ SandboxTesting::FieldOffsetMap& SandboxTesting::GetFieldOffsetMap() {
   bool is_initialized = fields.size() != 0;
   if (!is_initialized) {
     fields[MAP_TYPE]["instance_type"] = offsetof(Map, instance_type_);
+    fields[HEAP_NUMBER_TYPE]["value"] = offsetof(HeapNumber, value_);
     fields[FIXED_DOUBLE_ARRAY_TYPE]["length"] =
         offsetof(FixedDoubleArray, length_);
     fields[FIXED_DOUBLE_ARRAY_TYPE]["data"] =
@@ -1684,8 +1694,21 @@ SandboxTesting::FieldOffsetMap& SandboxTesting::GetFieldOffsetMap() {
     fields[FIXED_ARRAY_TYPE]["data"] = FixedArray::kHeaderSize;
     fields[WEAK_HOMOMORPHIC_FIXED_ARRAY_TYPE]["length"] =
         offsetof(WeakFixedArray, length_);
+    for (std::underlying_type_t<InstanceType> context_type = FIRST_CONTEXT_TYPE;
+         context_type <= LAST_CONTEXT_TYPE; ++context_type) {
+      InstanceType instance_type = static_cast<InstanceType>(context_type);
+      fields[instance_type]["scope_info"] = Context::kScopeInfoOffset;
+      fields[instance_type]["previous"] = Context::kPreviousOffset;
+    }
     fields[NATIVE_CONTEXT_TYPE]["microtask_queue"] =
         NativeContext::kMicrotaskQueueOffset;
+    fields[SCOPE_INFO_TYPE]["flags"] = offsetof(ScopeInfo, flags_);
+    fields[SCOPE_INFO_TYPE]["parameter_count"] =
+        offsetof(ScopeInfo, parameter_count_);
+    fields[SCOPE_INFO_TYPE]["context_local_count"] =
+        offsetof(ScopeInfo, context_local_count_);
+    fields[CLASS_BOILERPLATE_TYPE]["instance_properties_template"] =
+        offsetof(ClassBoilerplate, instance_properties_template_);
 #ifdef V8_INTL_SUPPORT
     fields[JS_SEGMENTS_TYPE]["icu_iterator_with_text"] =
         offsetof(JSSegments, icu_iterator_with_text_);

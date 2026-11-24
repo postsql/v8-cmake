@@ -42,7 +42,7 @@ PooledPage PooledPage::Create(NormalPage* metadata, Epoch epoch) {
   DCHECK_EQ(chunk_reservation.address(), metadata->ChunkAddress());
 
   MemoryChunk* chunk = metadata->Chunk();
-  DCHECK(!chunk->InReadOnlySpace());
+  DCHECK(!metadata->IsReadOnlyPage());
 
   // Destroy the chunk and the metadata object but do not release the underlying
   // memory as that is going to be pooled.
@@ -334,8 +334,9 @@ PooledPage MemoryPool::CreatePooledPage(NormalPage* metadata) {
                             current_epoch_.load(std::memory_order_relaxed));
 }
 
-MemoryPool::MemoryPool(Config config)
-    : config_(config),
+MemoryPool::MemoryPool(IsolateGroup* isolate_group, Config config)
+    : isolate_group_(isolate_group),
+      config_(config),
       page_pool_(config),
       zone_pool_(config),
       large_pool_(config),
@@ -466,7 +467,7 @@ class MemoryPool::ReleasePooledChunksTask final : public CancelableTask {
     if (config_.trace_gc_nvp) {
       // Run printing on *some* isolate. The isolate_ field may be destroyed -
       // it's only used for posting a task on the single threaded configuration.
-      IsolateGroup::current()->FindAnotherIsolateLocked(
+      pool_->isolate_group_->FindAnotherIsolateLocked(
           nullptr, [&stats](Isolate* isolate) {
             isolate->PrintWithTimestamp(
                 "Memory pool: Removed pages: %zu, removed large pages: %zu, "

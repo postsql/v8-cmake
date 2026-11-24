@@ -67,18 +67,12 @@
                                                                                \
   JS_FEATURE(harmony_shadow_realm, "harmony ShadowRealm")                      \
                                                                                \
-  JS_FEATURE(harmony_struct,                                                   \
-             "harmony structs, shared structs, and shared arrays")             \
-                                                                               \
   IF_INTL_ENABLED(JS_FEATURE, harmony_intl_best_fit_matcher,                   \
                   "Intl BestFitMatcher")                                       \
                                                                                \
   JS_FEATURE(js_decorators, "decorators")                                      \
                                                                                \
   JS_FEATURE(js_source_phase_imports, "source phase imports")                  \
-                                                                               \
-  JS_FEATURE(js_regexp_buffer_boundaries,                                      \
-             "RegExp \\A \\z \\Z buffer boundary assertions")                  \
                                                                                \
   IF_SPARKPLUG_PLUS_ENABLED(INTERNAL_FEATURE, sparkplug_inline_smi,            \
                             "inline the Smi fast path of embedded feedback "   \
@@ -173,6 +167,9 @@
                                                                                \
   JS_FEATURE(js_defer_import_eval, "defer import eval")                        \
                                                                                \
+  JS_FEATURE(js_regexp_buffer_boundaries,                                      \
+             "RegExp \\A \\z \\Z buffer boundary assertions")                  \
+                                                                               \
   /* Custom Descriptors proposal. */                                           \
   /* https://github.com/WebAssembly/custom-descriptors */                      \
   /* Note: the JS Interop part of the proposal is enabled by */                \
@@ -236,6 +233,11 @@
                                                                                \
   INTERNAL_FEATURE(homomorphic_ic,                                             \
                    "Homomorphic IC state for same-handler highly polymorphic " \
-                   "ICs")
+                   "ICs")                                                      \
+                                                                               \
+  /* V8 side owner: leszeks */                                                 \
+  INTERNAL_FEATURE(                                                            \
+      code_cache_source_hash_sha256,                                           \
+      "hashing code cache source string with SHA256 instead of string length")
 
 #endif  // V8_FLAGS_FEATURE_FLAGS_H_

@@ -25,6 +25,19 @@ MoveOperandKind GetKind(const InstructionOperand& move) {
   return IsFloatingPoint(loc_op.representation()) ? kFpReg : kGpReg;
 }
 
+// Returns the wider in-register GP representation (matching Is32BitOperand in
+// 64-bit backends' Use32BitMove helpers).
+MachineRepresentation WiderGpRepresentation(const InstructionOperand& src,
+                                            const InstructionOperand& dst) {
+  MachineRepresentation src_rep = LocationOperand::cast(src).representation();
+  if constexpr (kSystemPointerSize == 8) {
+    if (Is32BitOperand(src)) {
+      return LocationOperand::cast(dst).representation();
+    }
+  }
+  return src_rep;
+}
+
 }  // namespace
 
 void GapResolver::Resolve(ParallelMove* moves) {
@@ -61,6 +74,7 @@ void GapResolver::Resolve(ParallelMove* moves) {
     if (!move->IsEliminated()) PerformMove(moves, move);
   }
   assembler_->PopTempStackSlots();
+  DCHECK_EQ(assembler_->temp_slots_, 0);
 }
 
 // Check if a 2-move cycle is a swap. This is not always the case, for instance:
@@ -70,12 +84,16 @@ void GapResolver::Resolve(ParallelMove* moves) {
 //
 // The two stack operands conflict but start at a different stack offset, so a
 // swap would be incorrect.
-// In general, swapping is allowed if the conflicting operands:
-// - Have the same representation, and
-// - Are the same register, or are stack slots with the same index
+// In general, swapping is allowed if:
+// - The conflicting operands have the same representation and are the same
+//   register, or are stack slots with the same index, and
+// - The two swapped locations have the same representation (otherwise swapping
+//   a wider register with a narrower stack slot would access past the slot).
 bool IsSwap(MoveOperands* move1, MoveOperands* move2) {
   return move1->source() == move2->destination() &&
-         move2->source() == move1->destination();
+         move2->source() == move1->destination() &&
+         LocationOperand::cast(move1->source()).representation() ==
+             LocationOperand::cast(move1->destination()).representation();
 }
 
 void GapResolver::PerformCycle(const std::vector<MoveOperands*>& cycle) {
@@ -109,8 +127,29 @@ void GapResolver::PerformCycle(const std::vector<MoveOperands*>& cycle) {
   // register used during the move cycle, the platform implements
   // {SetPendingMove}, which marks the registers needed for the given moves.
   // {MoveToTempLocation} will then choose the location accordingly.
+  MachineRepresentation src_rep =
+      LocationOperand::cast(move1->source()).representation();
+  // Splitting {source -> destination} into {source -> temp[rep]} followed by
+  // {temp[rep] -> destination} must preserve all live bits of {source} in
+  // {temp} and match the width behavior of a direct {source -> destination}
+  // move:
+  // - For FP/SIMD, {source} never holds valid bits wider than {src_rep} (and
+  //   {Push} sizes stack temporaries from {src_rep}), so {rep = src_rep}
+  //   preserves all bits in {temp}, makes {temp[src_rep] -> destination} match
+  //   a direct move, and keeps {Push} and {Pop} balanced.
+  // - For GP on 64-bit targets, virtual register renaming allows a 32-bit
+  //   source to hold a zero-extended 64-bit value when {dst_rep} is 64-bit (so
+  //   {source -> temp[rep]} needs a 64-bit {rep}), while same-as-input
+  //   instructions such as x64 64-bit shifts with a 32-bit output require a
+  //   64-bit source to keep its upper bits into a 32-bit destination (so
+  //   {temp[rep] -> destination} also needs a 64-bit {rep}). Choosing the wider
+  //   GP representation satisfies both legs and matches {Use32BitMove(source,
+  //   destination)}.
   MachineRepresentation rep =
-      LocationOperand::cast(move1->destination()).representation();
+      IsFloatingPoint(src_rep)
+          ? src_rep
+          : WiderGpRepresentation(move1->source(), move1->destination());
+  DCHECK_EQ(ElementSizeInPointers(src_rep), ElementSizeInPointers(rep));
   for (size_t i = 0; i < cycle.size() - 1; ++i) {
     assembler_->SetPendingMove(cycle[i]);
   }

@@ -1,14 +1,14 @@
 [
   {
     "url": "https://chromium.googlesource.com/v8/v8.git",
-    "commit": "0985c342965fbca080b597b32281229d8f9efe28",
+    "commit": "dc04f2018e1b035ad6b49dd090878dc5b97e56fb",
     "/* comment */": "Dependency v8 must be first.",
-    "branch": "branch-heads/15.7",
+    "branch": "branch-heads/15.8",
     "path": ""
   },
   {
     "url": "https://chromium.googlesource.com/external/github.com/google/googletest.git",
-    "commit": "4fe3307fb2d9f86d19777c7eb0e4809e9694dde7",
+    "commit": "0b656495436f57212be8700794a3d5fb14000c5f",
     "branch": "master",
     "path": "third_party/googletest/src"
   },
@@ -20,7 +20,7 @@
   },
   {
     "url": "https://chromium.googlesource.com/chromium/src/third_party/zlib.git",
-    "commit": "456ae730017b9b4bd3371927abc82627fd51feef",
+    "commit": "9f9f52c60a14e8e772fb561029ae0a121fef7609",
     "branch": "master",
     "path": "third_party/zlib"
   },
@@ -38,7 +38,7 @@
   },
   {
     "url": "https://chromium.googlesource.com/chromium/src/third_party/abseil-cpp.git",
-    "commit": "9aa0c314d9bd021e48f0193f0af3316a7e8bec63",
+    "commit": "9a0a43cbad88a77703bd73093011a62bbe0a6740",
     "branch": "master",
     "path": "third_party/abseil-cpp"
   },
@@ -74,7 +74,7 @@
   },
   {
     "url": "https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libc.git",
-    "commit": "97e60a1e7f7180965cc84e22ddde9f1d4ffd640f",
+    "commit": "631cc29c6dde5bafcf4b22674af6ecad67147977",
     "branch": "master",
     "path": "third_party/llvm-libc/src"
   }

@@ -685,7 +685,7 @@ void InstructionSelector::VisitLoad(OpIndex node) {
     case MachineRepresentation::kCompressedPointer:  // Fall through.
     case MachineRepresentation::kCompressed:         // Fall through.
     case MachineRepresentation::kProtectedPointer:   // Fall through.
-    case MachineRepresentation::kIndirectPointer:    // Fall through.
+    case MachineRepresentation::kTrustedPointer:     // Fall through.
     case MachineRepresentation::kSandboxedPointer:   // Fall through.
     case MachineRepresentation::kWord64:             // Fall through.
     case MachineRepresentation::kMapWord:            // Fall through.
@@ -729,7 +729,7 @@ ArchOpcode GetStoreOpcode(MachineRepresentation rep) {
     case MachineRepresentation::kCompressedPointer:  // Fall through.
     case MachineRepresentation::kCompressed:         // Fall through.
     case MachineRepresentation::kProtectedPointer:   // Fall through.
-    case MachineRepresentation::kIndirectPointer:    // Fall through.
+    case MachineRepresentation::kTrustedPointer:     // Fall through.
     case MachineRepresentation::kSandboxedPointer:   // Fall through.
     case MachineRepresentation::kWord64:             // Fall through.
     case MachineRepresentation::kMapWord:            // Fall through.
@@ -3642,6 +3642,11 @@ InstructionSelector::AlignmentRequirements() {
   req_aligned.Add(MachineRepresentation::kFloat64);
   return MachineOperatorBuilder::AlignmentRequirements::
       SomeUnalignedAccessUnsupported(req_aligned, req_aligned);
+}
+
+void InstructionSelector::EmitDecompressTaggedParam(
+    OpIndex node, InstructionOperand temp_op) {
+  UNREACHABLE();
 }
 
 }  // namespace compiler

@@ -545,7 +545,6 @@ class ScavengerObjectVisitorBase : public NewSpaceVisitor<ConcreteVisitor> {
             : nullptr;
 #endif  // !V8_COMPRESS_POINTERS
     if (array_buffer_extension) {
-      array_buffer_extension->InitializationBarrier();
       if constexpr (kExpectedObjectAge == ObjectAge::kYoung) {
         array_buffer_extension->YoungMark();
       } else {
@@ -1357,12 +1356,12 @@ void ScavengerCollector::QuarantinedPageSweeper::JobTask::Run(
     NormalPage* page =
         static_cast<NormalPage*>(chunk->Metadata(heap_->isolate()));
     DCHECK(!chunk->IsFromPage());
-    if (chunk->IsToPage()) {
+    if (page->owner_identity() == NEW_SPACE) {
+      DCHECK(chunk->IsToPage());
       SweepPage(CreateFillerFreeSpaceHandler, chunk, page,
                 next_page_iterator_->second);
     } else {
-      DCHECK_EQ(chunk->Metadata(heap_->isolate())->owner()->identity(),
-                OLD_SPACE);
+      DCHECK_EQ(page->owner_identity(), OLD_SPACE);
       base::MutexGuard guard(page->mutex());
       // If for some reason the page is swept twice, this DCHECK will fail.
       DCHECK_EQ(page->area_size(), page->allocated_bytes());

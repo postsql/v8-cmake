@@ -69,9 +69,9 @@ def update_one(dep):
     what = '+refs/{}:refs/{}'.format(branch, branch)
 
   try:
-    git('fetch', '--depth=1', url, what, cwd=clonedir, dry_run=dry_run)
+    git('--git-dir=.', 'fetch', '--depth=1', url, what, cwd=clonedir, dry_run=dry_run)
   except subprocess.CalledProcessError:
-    git('fetch', url, what, cwd=clonedir, dry_run=dry_run)
+    git('--git-dir=.', 'fetch', url, what, cwd=clonedir, dry_run=dry_run)
 
 
 def update_all():
@@ -94,11 +94,11 @@ def update_all():
   update_one(v8)
   if repodir_exists(v8):
     v8['commit'] = (
-        git('rev-parse', v8['branch'], check_output=True, cwd=repodir(v8)))
+        git('--git-dir=.', 'rev-parse', v8['branch'], check_output=True, cwd=repodir(v8)))
 
     # Now for some arbitrary code execution...
     what = '{}:DEPS'.format(v8['commit'])
-    source = git('show', what, check_output=True, cwd=repodir(v8))
+    source = git('--git-dir=.', 'show', what, check_output=True, cwd=repodir(v8))
   elif dry_run and exists('v8/DEPS'):
     with open('v8/DEPS') as fp:
       source = fp.read()
@@ -141,7 +141,7 @@ def update_all():
   git('rm', arg, '-r', 'v8', dry_run=dry_run)
 
   for dep in deps:
-    cmd = '(cd {} && {} archive --format=tar --prefix=v8/{}/ {}) | {} x'.format(
+    cmd = '(cd {} && {} --git-dir=. archive --format=tar --prefix=v8/{}/ {}) | {} x'.format(
         repodir(dep), options.git, dep['path'], dep['commit'], options.tar)
     if dry_run:
       print(cmd)
@@ -158,7 +158,7 @@ def update_all():
         os.remove(join(path, filename))
 
   git('add', '-f', 'v8', dry_run=dry_run)
-  git('log', '-1', '--oneline', v8['commit'], cwd=repodir(v8),
+  git('--git-dir=.', 'log', '-1', '--oneline', v8['commit'], cwd=repodir(v8),
       dry_run=dry_run and not repodir_exists(v8))
 
   newdeps = json.dumps(deps, indent=2)

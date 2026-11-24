@@ -1011,6 +1011,7 @@ class V8_EXPORT_PRIVATE MapRef : public HeapObjectRef {
   int construction_counter() const;
   bool is_migration_target() const;
   bool is_extensible() const;
+  bool is_prototype_map() const;
   bool supports_fast_array_iteration(JSHeapBroker* broker) const;
   bool supports_fast_array_resize(JSHeapBroker* broker) const;
   bool is_abandoned_prototype_map() const;
@@ -1033,6 +1034,7 @@ class V8_EXPORT_PRIVATE MapRef : public HeapObjectRef {
   bool IsBooleanMap(JSHeapBroker* broker) const;
   bool IsNullMap(JSHeapBroker* broker) const;
   bool IsUndefinedMap(JSHeapBroker* broker) const;
+  bool IsAnyWasmObjectMap() const;
 
   OptionalHeapObjectRef GetBackPointer(JSHeapBroker* broker) const;
 
@@ -1056,6 +1058,8 @@ class V8_EXPORT_PRIVATE MapRef : public HeapObjectRef {
   MapRef FindRootMap(JSHeapBroker* broker) const;
   OptionalObjectRef GetConstructor(JSHeapBroker* broker) const;
   NativeContextRef native_context(JSHeapBroker* broker) const;
+  bool BelongsToSameNativeContextAs(JSHeapBroker* broker,
+                                    ContextRef context) const;
 };
 
 struct HolderLookupResult {
@@ -1260,6 +1264,7 @@ class V8_EXPORT_PRIVATE SharedFunctionInfoRef : public HeapObjectRef {
   int context_header_size() const;
   int context_parameters_start() const;
   BytecodeArrayRef GetBytecodeArray(JSHeapBroker* broker) const;
+  bool is_eager_inlining_disabled(JSHeapBroker* broker) const;
   bool HasBreakInfo(JSHeapBroker* broker) const;
   SharedFunctionInfo::Inlineability GetInlineability(
       CodeKind code_kind, JSHeapBroker* broker) const;
