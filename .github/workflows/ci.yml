@@ -22,7 +22,12 @@ jobs:
           git config --global core.longpaths true
           cmake -E make_directory ${{runner.workspace}}/build
       - name: configure
+        if: matrix.os != 'windows-latest'
         run: cmake ${{runner.workspace}}/v8-cmake
+        working-directory: ${{runner.workspace}}/build
+      - name: configure-windows
+        if: matrix.os == 'windows-latest'
+        run: cmake -T ClangCL ${{runner.workspace}}/v8-cmake
         working-directory: ${{runner.workspace}}/build
       - name: build
         run: cmake --build ${{runner.workspace}}/build -j 2

@@ -3,15 +3,24 @@ set(CMAKE_USER_MAKE_RULES_OVERRIDE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/MSVC.cmake
 set(CMAKE_DISABLE_IN_SOURCE_BUILD ON)
 project(V8 LANGUAGES CXX C ASM)
 
+set(is-msvc-cli 0)
+if(MSVC AND NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
+  set(is-msvc-cli 1)
+endif()
+
 if(MSVC)
   enable_language(ASM_MASM)
   set_property(
-    SOURCE ${PROJECT_BINARY_DIR}/embedded.S
-           v8/src/heap/base/asm/arm64/push_registers_masm.asm
+    SOURCE v8/src/heap/base/asm/arm64/push_registers_masm.asm
            v8/src/heap/base/asm/ia32/push_registers_masm.asm
            v8/src/heap/base/asm/x64/push_registers_masm.asm
     PROPERTY LANGUAGE ASM_MASM)
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    set_property(SOURCE ${PROJECT_BINARY_DIR}/embedded.S PROPERTY LANGUAGE ASM_MASM)
+  endif()
+endif()
 
+if(is-msvc-cli)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/FI${CMAKE_CURRENT_SOURCE_DIR}/cmake/msvc_compat.h>)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/wd4716>)
@@ -67,6 +76,24 @@ if (NOT CMAKE_C_STANDARD)
   set(CMAKE_C_STANDARD 90)
 endif()
 
+set(v8_atomic_lib "")
+if(UNIX AND NOT APPLE)
+  include(CheckCXXSourceCompiles)
+  check_cxx_source_compiles("
+    #include <atomic>
+    #include <cstdint>
+    struct S { uint32_t a; uint32_t b; };
+    int main() {
+      std::atomic<S> x{{1, 2}};
+      S expected{1, 2};
+      return x.compare_exchange_strong(expected, S{3, 4}) ? 0 : 1;
+    }
+  " V8_CXX_ATOMIC_WITHOUT_LIBATOMIC)
+  if(NOT V8_CXX_ATOMIC_WITHOUT_LIBATOMIC)
+    set(v8_atomic_lib atomic)
+  endif()
+endif()
+
 set(is-freebsd $<PLATFORM_ID:FreeBSD>)
 set(is-darwin $<PLATFORM_ID:Darwin>)
 set(is-linux $<PLATFORM_ID:Linux>)
@@ -79,7 +106,7 @@ string(CONCAT is-posix $<OR:
   ${is-aix}
 >)
 
-set(is-msvc $<CXX_COMPILER_ID:MSVC>)
+set(is-msvc $<BOOL:${MSVC}>)
 
 set(is-arm 0)
 set(is-arm64 0)
@@ -161,31 +188,31 @@ set(
 )
 
 set(disable-exceptions
-  $<$<CXX_COMPILER_ID:MSVC>:/EHs-c->
-  $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-fno-exceptions>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<BOOL:${is-msvc-cli}>>:/EHs-c->
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<BOOL:${is-msvc-cli}>>,$<CXX_COMPILER_ID:Clang,AppleClang,GNU>>:-fno-exceptions>
 )
 
 set(enable-exceptions
-  $<$<CXX_COMPILER_ID:MSVC>:/EHsc>
-  $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-fexceptions>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<BOOL:${is-msvc-cli}>>:/EHsc>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<BOOL:${is-msvc-cli}>>,$<CXX_COMPILER_ID:Clang,AppleClang,GNU>>:-fexceptions>
 )
 
 set(enable-fpic
-  $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-fPIC>
+  $<$<AND:$<NOT:$<BOOL:${is-msvc-cli}>>,$<CXX_COMPILER_ID:Clang,AppleClang,GNU>>:-fPIC>
 )
 
 set(v8_warning_suppressions
-  $<$<CXX_COMPILER_ID:GNU>:-Wno-attributes>
-  $<$<CXX_COMPILER_ID:GNU>:-Wno-return-type>
-  $<$<CXX_COMPILER_ID:GNU>:-Wno-stringop-overflow>
-  $<$<CXX_COMPILER_ID:GNU>:-Wno-dangling-pointer>
-  $<$<CXX_COMPILER_ID:GNU>:-Wno-changes-meaning>
-  $<$<CXX_COMPILER_ID:GNU>:-Wno-invalid-constexpr>
-  $<$<AND:$<BOOL:${is-arm64}>,$<CXX_COMPILER_ID:GNU>>:-flax-vector-conversions>
-  $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-Wno-invalid-offsetof>
-  $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-Wno-deprecated-declarations>
-  $<$<CXX_COMPILER_ID:MSVC>:/wd4716>
-  $<$<CXX_COMPILER_ID:MSVC>:/wd4715>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:GNU>>:-Wno-attributes>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:GNU>>:-Wno-return-type>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:GNU>>:-Wno-stringop-overflow>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:GNU>>:-Wno-dangling-pointer>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:GNU>>:-Wno-changes-meaning>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:GNU>>:-Wno-invalid-constexpr>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<BOOL:${is-arm64}>,$<CXX_COMPILER_ID:GNU>>:-flax-vector-conversions>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:Clang,AppleClang,GNU>>:-Wno-invalid-offsetof>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:Clang,AppleClang,GNU>>:-Wno-deprecated-declarations>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<BOOL:${is-msvc-cli}>>:/wd4716>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<BOOL:${is-msvc-cli}>>:/wd4715>
 )
 
 #
@@ -239,7 +266,8 @@ add_executable(
         shell
         v8/samples/shell.cc
 )
-target_compile_definitions(shell PRIVATE ${v8_defines})
+target_compile_definitions(shell PRIVATE ${v8_defines} $<${is-msvc}:_HAS_EXCEPTIONS=0>)
+target_compile_options(shell PRIVATE ${disable-exceptions} ${v8_warning_suppressions})
 target_include_directories(shell
         PUBLIC
         $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/v8/include>
@@ -261,7 +289,8 @@ add_executable(
         hello-world
         v8/samples/hello-world.cc
 )
-target_compile_definitions(hello-world PRIVATE ${v8_defines})
+target_compile_definitions(hello-world PRIVATE ${v8_defines} $<${is-msvc}:_HAS_EXCEPTIONS=0>)
+target_compile_options(hello-world PRIVATE ${disable-exceptions} ${v8_warning_suppressions})
 target_include_directories(hello-world
         PUBLIC
         $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/v8/include>
@@ -780,9 +809,31 @@ target_link_libraries(v8_initializers PRIVATE v8_libbase v8_torque_generated v8-
 
 # Note: v8_use_external_startup_data not currently supported.
 # Note: v8_use_multi_snapshots not currently supported.
+if(MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  set(v8_embedded_asm_target ${PROJECT_BINARY_DIR}/embedded.obj)
+  add_custom_command(
+    OUTPUT ${v8_embedded_asm_target}
+    BYPRODUCTS ${PROJECT_BINARY_DIR}/embedded.asm
+    COMMAND ${CMAKE_CXX_COMPILER} /nologo
+      $<${is-x64}:--target=x86_64-pc-windows-msvc>
+      $<${is-arm64}:--target=aarch64-pc-windows-msvc>
+      $<${is-ia32}:--target=i686-pc-windows-msvc>
+      /Fa${PROJECT_BINARY_DIR}/embedded.asm
+      /Fo${v8_embedded_asm_target}
+      /c -- ${PROJECT_BINARY_DIR}/embedded.S
+    DEPENDS ${PROJECT_BINARY_DIR}/embedded.S
+    WORKING_DIRECTORY ${PROJECT_BINARY_DIR}
+    VERBATIM
+    COMMAND_EXPAND_LISTS
+  )
+  set_source_files_properties(${v8_embedded_asm_target} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+else()
+  set(v8_embedded_asm_target ${PROJECT_BINARY_DIR}/embedded.S)
+endif()
+
 add_library(
   v8_snapshot STATIC
-  ${PROJECT_BINARY_DIR}/embedded.S
+  ${v8_embedded_asm_target}
   ${PROJECT_BINARY_DIR}/snapshot.cc
   v8/src/init/setup-isolate-deserialize.cc
 )
@@ -1084,6 +1135,7 @@ target_link_libraries(v8_libbase
     Threads::Threads
     $<${is-linux}:${CMAKE_DL_LIBS}>
     $<${is-linux}:rt>
+    ${v8_atomic_lib}
     $<${is-win}:winmm>
     $<${is-win}:dbghelp>
     "$<$<PLATFORM_ID:Darwin>:-framework CoreFoundation>"
