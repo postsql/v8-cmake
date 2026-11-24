@@ -18,6 +18,9 @@ if(MSVC)
   if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set_property(SOURCE ${PROJECT_BINARY_DIR}/embedded.S PROPERTY LANGUAGE ASM_MASM)
   endif()
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|x86_64)$")
+    string(APPEND CMAKE_EXE_LINKER_FLAGS " /STACK:2097152")
+  endif()
 endif()
 
 if(is-msvc-cli)
@@ -25,6 +28,9 @@ if(is-msvc-cli)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/FI${CMAKE_CURRENT_SOURCE_DIR}/cmake/msvc_compat.h>)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/wd4716>)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/wd4715>)
+  add_compile_options($<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:Clang>>:/clang:-fconstexpr-steps=16777216>)
+else()
+  add_compile_options($<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:Clang,AppleClang>>:-fconstexpr-steps=16777216>)
 endif()
 
 add_definitions(
@@ -181,7 +187,7 @@ set(
   $<$<AND:$<BOOL:${V8_ENABLE_SANDBOX}>,${is-64bit-sandbox-arch}>:CPPGC_POINTER_COMPRESSION>
   $<$<AND:$<BOOL:${V8_ENABLE_SANDBOX}>,${is-64bit-sandbox-arch}>:CPPGC_SLIM_WRITE_BARRIER>
   $<${is-win}:NOMINMAX>
-  $<$<AND:${is-win},${is-x64}>:V8_OS_WIN_X64>
+  $<$<AND:${is-win},${is-x64}>:V8_OS_WIN_X64=true>
   $<$<BOOL:${V8_ENABLE_CONCURRENT_MARKING}>:V8_CONCURRENT_MARKING>
   $<$<BOOL:${enable-fPIC}>:V8_TLS_USED_IN_LIBRARY>
   $<${is-win}:V8_OS_WIN32>
@@ -1138,6 +1144,7 @@ target_link_libraries(v8_libbase
     ${v8_atomic_lib}
     $<${is-win}:winmm>
     $<${is-win}:dbghelp>
+    $<${is-win}:ws2_32>
     "$<$<PLATFORM_ID:Darwin>:-framework CoreFoundation>"
 )
 
@@ -1381,6 +1388,9 @@ target_link_libraries(mksnapshot
     v8_initializers
     v8_compiler
 )
+if(MSVC)
+  set_property(TARGET mksnapshot APPEND_STRING PROPERTY LINK_FLAGS " /OPT:NOICF")
+endif()
 
 add_library(v8-adler32 OBJECT v8/third_party/zlib/adler32.c)
 if(enable-fPIC)
